@@ -1,11 +1,20 @@
 # Builds for the platform the image is for (amd64, arm64, ...) without
 # emulation: the Go build cross-compiles and needs no C toolchain.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS ui
+RUN npm install -g pnpm@12.15.0
+WORKDIR /ui
+COPY ui/package.json ui/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY ui/ ./
+RUN pnpm build
+
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=ui /ui/dist ./ui/dist
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /unified .
 
 FROM alpine:3.22

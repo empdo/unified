@@ -2,7 +2,7 @@
 
 One program that finds, downloads and files movies and TV episodes:
 a library, Torznab search, release ranking, an embedded BitTorrent client
-and a hardlinking importer, with a terminal interface and a small web UI.
+and a hardlinking importer, with a terminal interface and a web UI.
 
 ## Web UI
 
@@ -13,9 +13,21 @@ and a hardlinking importer, with a terminal interface and a small web UI.
 every 30 minutes for wanted items still missing (including newly aired
 episodes). Don't run `unified run` at the same time.
 
+The UI has the library with posters, a page per movie or show, search, the
+releases found for anything, downloads with progress, and settings. Indexers,
+the TMDB key, quality rules and the password can be changed there and apply
+at once; saving rewrites the config file (without its comments).
+
 ## Build
 
+The web UI is a React app in `ui/`, built into the binary, so build it first:
+
+    pnpm -C ui install
+    pnpm -C ui build
     go build -o unified .
+
+While working on the UI, run `./unified serve` and `pnpm -C ui dev`, and open
+the address Vite prints; API calls are forwarded to the running server.
 
 ## Use
 
@@ -66,7 +78,8 @@ The image builds for amd64 and arm64:
 ## Layout
 
     main.go, run.go        CLI and the wanted -> downloading -> imported loop
-    web.go, web/           web UI (templates and stylesheet are embedded in the binary)
+    api.go                 JSON API for the web UI, and serving the built app
+    ui/                    the web UI (React, TypeScript, Vite)
     Dockerfile, docker/    container image and its startup script
     internal/config        TOML config
     internal/store         SQLite library and download state

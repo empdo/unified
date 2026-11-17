@@ -1,0 +1,161 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"unified/internal/config"
+	"unified/internal/store"
+)
+
+// newTestServer returns a server with a fresh config file and database. The
+// runner has no torrent engine; the handlers under test don't need one.
+func newTestServer(t *testing.T, password string) (*server, http.Handler) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `data_dir = "` + dir + `/data"
+download_dir = "` + dir + `/downloads"
+movies_dir = "` + dir + `/movies"
+tv_dir = "` + dir + `/tv"
+password = "` + password + `"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conf, err := config.NewLive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := &server{conf: conf, st: st, run: &runner{wake: make(chan struct{}, 1)}}
+	return s, s.routes()
+}
+
+func do(h http.Handler, method, path, body, password string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	if password != "" {
+		r.SetBasicAuth("anyone", password)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
+func TestLoginAndHealth(t *testing.T) {
+	s, h := newTestServer(t, "hunter2")
+	for _, c := range []struct {
+		path, password string
+		want           int
+	}{
+		{"/api/library", "", 401},
+		{"/api/library", "wrong", 401},
+		{"/api/library", "hunter2", 200},
+		{"/", "hunter2", 200},
+		{"/health", "", 200},
+	} {
+		if got := do(h, "GET", c.path, "", c.password).Code; got != c.want {
+			t.Errorf("GET %s with %q: %d, want %d", c.path, c.password, got, c.want)
+		}
+	}
+	s.run.vpnErr = `VPN interface "wg0" not found`
+	if got := do(h, "GET", "/health", "", "").Code; got != 503 {
+		t.Errorf("health with VPN down: %d, want 503", got)
+	}
+}
+
+func TestServesApp(t *testing.T) {
+	_, h := newTestServer(t, "")
+	w := do(h, "GET", "/", "", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `<div id="root">`) {
+		t.Fatalf("GET /: %d\n%s", w.Code, w.Body.String())
+	}
+	if w := do(h, "GET", "/api/nope", "", ""); w.Code != 404 || !strings.Contains(w.Body.String(), "error") {
+		t.Errorf("unknown endpoint: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLibraryAndWanting(t *testing.T) {
+	s, h := newTestServer(t, "")
+	id, err := s.st.AddMedia(store.Media{Kind: "show", TMDBID: 95396, Title: "Severance", Year: 2022, Poster: "/p.jpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ep := 1; ep <= 3; ep++ {
+		s.st.UpsertItem(id, 1, ep, "", "2022-02-18", false)
+	}
+
+	var lib []mediaView
+	json.Unmarshal(do(h, "GET", "/api/library", "", "").Body.Bytes(), &lib)
+	if len(lib) != 1 || lib[0].Poster != "https://image.tmdb.org/t/p/w342/p.jpg" || lib[0].Counts["ignored"] != 3 {
+		t.Fatalf("library = %+v", lib)
+	}
+
+	if w := do(h, "POST", "/api/media/1/seasons/1", `{"want":true}`, ""); w.Code != 204 {
+		t.Fatalf("want season: %d %s", w.Code, w.Body.String())
+	}
+	var detail struct {
+		Seasons []seasonView `json:"seasons"`
+	}
+	json.Unmarshal(do(h, "GET", "/api/media/1", "", "").Body.Bytes(), &detail)
+	if len(detail.Seasons) != 1 || detail.Seasons[0].Episodes[2].State != store.Wanted {
+		t.Fatalf("after wanting the season: %+v", detail)
+	}
+
+	first := detail.Seasons[0].Episodes[0].ID
+	do(h, "POST", "/api/items/"+itoa(first), `{"want":false}`, "")
+	json.Unmarshal(do(h, "GET", "/api/media/1", "", "").Body.Bytes(), &detail)
+	if detail.Seasons[0].Episodes[0].State != store.Ignored {
+		t.Errorf("episode not unwanted: %+v", detail.Seasons[0].Episodes[0])
+	}
+}
+
+func TestSettingsRoundTrip(t *testing.T) {
+	s, h := newTestServer(t, "")
+	body := `{"tmdbKey":"k","indexers":[{"name":"p","url":"http://x/1/api","apiKey":"a"}],
+		"quality":{"resolutions":["2160p","1080p"],"preferCodecs":["x265"],"maxMovieGB":20,"maxEpisodeGB":5,"minSeeders":3},
+		"password":"secret"}`
+	if w := do(h, "PUT", "/api/settings", body, ""); w.Code != 204 {
+		t.Fatalf("save: %d %s", w.Code, w.Body.String())
+	}
+	if got := s.conf.Get(); got.TMDBKey != "k" || got.Quality.Resolutions[0] != "2160p" || got.Password != "secret" {
+		t.Fatalf("live config not updated: %+v", got)
+	}
+	// The password applies at once.
+	if w := do(h, "GET", "/api/settings", "", ""); w.Code != 401 {
+		t.Errorf("without the new password: %d, want 401", w.Code)
+	}
+	var got struct {
+		Indexers []indexerView `json:"indexers"`
+		Quality  qualityView   `json:"quality"`
+	}
+	json.Unmarshal(do(h, "GET", "/api/settings", "", "secret").Body.Bytes(), &got)
+	if len(got.Indexers) != 1 || got.Quality.MinSeeders != 3 {
+		t.Errorf("settings read back: %+v", got)
+	}
+	// Leaving the password out keeps it.
+	body = strings.Replace(body, `,
+		"password":"secret"`, "", 1)
+	do(h, "PUT", "/api/settings", body, "secret")
+	if s.conf.Get().Password != "secret" {
+		t.Error("password was cleared by a save that did not mention it")
+	}
+	// Bad input is refused and changes nothing.
+	if w := do(h, "PUT", "/api/settings", `{"quality":{"resolutions":[]}}`, "secret"); w.Code != 400 {
+		t.Errorf("empty resolutions: %d, want 400", w.Code)
+	}
+	if s.conf.Get().TMDBKey != "k" {
+		t.Error("a refused save changed the config")
+	}
+}
+
+func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
