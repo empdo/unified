@@ -1,0 +1,23 @@
+services:
+  unified:
+    build: .
+    image: unified:latest
+    container_name: unified
+    restart: unless-stopped
+    # Needed to create the WireGuard interface.
+    cap_add: [NET_ADMIN]
+    environment:
+      # Files are created as this user and group. Match the owner of your media.
+      PUID: "1000"
+      PGID: "1000"
+      # Web UI password (or set password in config.toml).
+      # UNIFIED_PASSWORD: "change-me"
+      TZ: Europe/Stockholm
+    volumes:
+      # config.toml, the database, and wg0.conf (your Mullvad WireGuard file).
+      - ./config:/config
+      # Downloads, movies and tv in one mount, so hardlinks work. Point this at
+      # your media share, e.g. /mnt/nas/media:/media.
+      - ./media:/media
+    ports:
+      - "8080:8080"
