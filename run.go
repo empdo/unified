@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -57,6 +58,10 @@ type Progress struct {
 	Total   int64   `json:"total"`
 	Peers   int     `json:"peers"`
 	Rate    float64 `json:"rate"` // bytes per second
+	// For seeding downloads: bytes uploaded since unified started, and that
+	// as a multiple of the size.
+	Uploaded int64   `json:"uploaded"`
+	Ratio    float64 `json:"ratio"`
 }
 
 // runner drives items through wanted -> downloading -> imported. Everything
@@ -67,6 +72,8 @@ type runner struct {
 	st     *store.Store
 	eng    *engine.Engine
 	active map[int64]*activeDownload
+	// Imported downloads still in the client, until they reach the seed ratio.
+	seeding map[int64]*activeDownload
 	// Items with no acceptable release this round; not searched again until
 	// the next retry.
 	exhausted map[int64]bool
@@ -75,9 +82,11 @@ type runner struct {
 
 	wake  chan struct{}
 	fails chan int64
+	grabs chan grabRequest
 
 	mu       sync.Mutex
 	snapshot []Progress
+	seeds    []Progress
 	lines    []string
 	vpn      string // interface and addresses, "" when not bound
 	vpnErr   string
@@ -85,10 +94,11 @@ type runner struct {
 
 // Status is what the web UI shows about the runner.
 type Status struct {
-	Active []Progress `json:"active"`
-	Log    []string   `json:"log"` // newest first
-	VPN    string     `json:"vpn"`
-	VPNErr string     `json:"vpnError"`
+	Active  []Progress `json:"active"`
+	Seeding []Progress `json:"seeding"`
+	Log     []string   `json:"log"` // newest first
+	VPN     string     `json:"vpn"`
+	VPNErr  string     `json:"vpnError"`
 }
 
 func newRunner(ctx context.Context, cfg func() *config.Config, st *store.Store) (*runner, error) {
@@ -100,9 +110,11 @@ func newRunner(ctx context.Context, cfg func() *config.Config, st *store.Store) 
 	r := &runner{
 		ctx: ctx, cfg: cfg, st: st, eng: eng,
 		active:    map[int64]*activeDownload{},
+		seeding:   map[int64]*activeDownload{},
 		exhausted: map[int64]bool{},
 		wake:      make(chan struct{}, 1),
 		fails:     make(chan int64, 16),
+		grabs:     make(chan grabRequest),
 	}
 	if vpn, _ := eng.VPN(); vpn != "" {
 		r.vpn = vpn
@@ -143,6 +155,31 @@ func (r *runner) Fail(id int64) {
 	}
 }
 
+type grabRequest struct {
+	items       []int64
+	title, link string
+	reply       chan error
+}
+
+// Grab starts a release chosen by hand for the given items, whatever its
+// ranking.
+func (r *runner) Grab(ctx context.Context, items []int64, title, link string) error {
+	g := grabRequest{items, title, link, make(chan error, 1)}
+	select {
+	case r.grabs <- g:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+	select {
+	case err := <-g.reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (r *runner) Snapshot() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -150,7 +187,10 @@ func (r *runner) Snapshot() Status {
 	for i, l := range r.lines {
 		lines[len(lines)-1-i] = l
 	}
-	return Status{Active: append([]Progress(nil), r.snapshot...), Log: lines, VPN: r.vpn, VPNErr: r.vpnErr}
+	return Status{
+		Active: append([]Progress(nil), r.snapshot...), Seeding: append([]Progress(nil), r.seeds...),
+		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr,
+	}
 }
 
 // checkVPN updates the VPN status, logging changes, and reports whether
@@ -238,6 +278,17 @@ func (r *runner) loop(keepRunning bool) error {
 			}
 			pending = true
 			continue
+		case g := <-r.grabs:
+			if !up {
+				g.reply <- errors.New("the VPN is down, torrents are paused")
+				continue
+			}
+			dl, err := r.start(g.items, g.title, g.link)
+			if err == nil {
+				r.logf("grabbed [%d] %s (chosen by hand)", dl.ID, dl.Name)
+			}
+			g.reply <- err
+			continue
 		case <-tick.C:
 		}
 		if !up {
@@ -253,7 +304,34 @@ func (r *runner) loop(keepRunning bool) error {
 				pending = true
 			}
 		}
+		r.stopSeeding()
 	}
+}
+
+// stopSeeding removes imported downloads that reached the seed ratio from
+// the client. Their files stay where they are.
+func (r *runner) stopSeeding() {
+	limit := r.cfg().SeedRatio
+	if limit <= 0 {
+		return
+	}
+	for id, a := range r.seeding {
+		if ratio := seedRatio(a.t); ratio >= limit {
+			r.logf("[%d] reached seed ratio %.2f, stopped seeding", id, ratio)
+			a.t.Drop()
+			delete(r.seeding, id)
+		}
+	}
+}
+
+// seedRatio is the data uploaded since the torrent was added, as a multiple
+// of its size.
+func seedRatio(t *torrent.Torrent) float64 {
+	if !engine.HasInfo(t) || t.Length() == 0 {
+		return 0
+	}
+	st := t.Stats()
+	return float64(st.BytesWrittenData.Int64()) / float64(t.Length())
 }
 
 func (r *runner) publish() {
@@ -279,8 +357,20 @@ func (r *runner) publish() {
 		ps = append(ps, p)
 	}
 	sort.Slice(ps, func(i, j int) bool { return ps[i].ID < ps[j].ID })
+
+	var seeds []Progress
+	for _, a := range r.seeding {
+		st := a.t.Stats()
+		seeds = append(seeds, Progress{
+			ID: a.dl.ID, MediaID: a.mediaID, Name: a.dl.Name, Status: engine.Status(a.t),
+			HasInfo: true, Percent: 100, Done: a.t.Length(), Total: a.t.Length(), Peers: st.ActivePeers,
+			Uploaded: st.BytesWrittenData.Int64(), Ratio: seedRatio(a.t),
+		})
+	}
+	sort.Slice(seeds, func(i, j int) bool { return seeds[i].ID < seeds[j].ID })
+
 	r.mu.Lock()
-	r.snapshot = ps
+	r.snapshot, r.seeds = ps, seeds
 	r.mu.Unlock()
 }
 
@@ -392,43 +482,53 @@ func (r *runner) grab(items []store.Item, w release.Want) bool {
 			break
 		}
 		attempts++
-		source, err := r.eng.Resolve(r.ctx, c.Link)
+		dl, err := r.start(ids, c.Title, c.Link)
 		if err != nil {
 			r.logf("  skipping %s: %v", c.Title, err)
-			continue
-		}
-		t, err := r.eng.Add(source)
-		if err != nil {
-			r.logf("  skipping %s: %v", c.Title, err)
-			continue
-		}
-		hash := t.InfoHash().HexString()
-		if r.st.HasInfoHash(hash) {
-			// Same torrent as an earlier download under another name. Only
-			// drop it if it is not the one currently running.
-			if !r.isActive(hash) {
-				t.Drop()
-			}
-			continue
-		}
-		dl, err := r.st.CreateDownload(hash, c.Title, source, ids)
-		if err != nil {
-			r.logf("  skipping %s: %v", c.Title, err)
-			t.Drop()
 			continue
 		}
 		r.logf("  grabbed [%d] %s (%s, %d seeders)", dl.ID, c.Title, engine.Size(c.Size), c.Seeders)
-		r.track(dl, t)
 		return true
 	}
 	r.logf("  no acceptable release found")
 	return false
 }
 
-func (r *runner) isActive(hash string) bool {
-	for _, a := range r.active {
-		if a.dl.InfoHash == hash {
-			return true
+// start adds a release to the client and records it as the download for the
+// given items.
+func (r *runner) start(ids []int64, title, link string) (store.Download, error) {
+	source, err := r.eng.Resolve(r.ctx, link)
+	if err != nil {
+		return store.Download{}, err
+	}
+	t, err := r.eng.Add(source)
+	if err != nil {
+		return store.Download{}, err
+	}
+	hash := t.InfoHash().HexString()
+	if r.st.HasInfoHash(hash) {
+		// Same torrent as an earlier download, maybe under another name. Only
+		// drop it if it is not the one currently running or seeding.
+		if !r.inClient(hash) {
+			t.Drop()
+		}
+		return store.Download{}, errors.New("this torrent was grabbed before")
+	}
+	dl, err := r.st.CreateDownload(hash, title, source, ids)
+	if err != nil {
+		t.Drop()
+		return store.Download{}, err
+	}
+	r.track(dl, t)
+	return dl, nil
+}
+
+func (r *runner) inClient(hash string) bool {
+	for _, set := range []map[int64]*activeDownload{r.active, r.seeding} {
+		for _, a := range set {
+			if a.dl.InfoHash == hash {
+				return true
+			}
 		}
 	}
 	return false
@@ -468,14 +568,14 @@ func (r *runner) fail(a *activeDownload, why string) error {
 }
 
 // finish imports a completed download. The torrent stays in the client so it
-// keeps seeding for as long as unified runs.
+// keeps seeding until it reaches the seed ratio, or unified stops.
 func (r *runner) finish(a *activeDownload) error {
 	items, err := r.st.DownloadItems(a.dl.ID)
 	if err != nil {
 		return err
 	}
 	if len(items) == 0 {
-		return r.st.FinishDownload(a.dl.ID)
+		return r.done(a)
 	}
 	m, err := r.st.Media(items[0].MediaID)
 	if err != nil {
@@ -498,5 +598,13 @@ func (r *runner) finish(a *activeDownload) error {
 	if len(results) == 0 {
 		return r.fail(a, "no file matched what was wanted")
 	}
-	return r.st.FinishDownload(a.dl.ID)
+	return r.done(a)
+}
+
+func (r *runner) done(a *activeDownload) error {
+	if err := r.st.FinishDownload(a.dl.ID); err != nil {
+		return err
+	}
+	r.seeding[a.dl.ID] = a
+	return nil
 }

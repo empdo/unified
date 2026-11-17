@@ -80,6 +80,7 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("POST /api/items/{id}", s.wantItem)
 	api.HandleFunc("GET /api/find", s.find)
 	api.HandleFunc("GET /api/releases", s.releases)
+	api.HandleFunc("POST /api/releases/grab", s.grabRelease)
 	api.HandleFunc("POST /api/search", s.searchNow)
 	api.HandleFunc("POST /api/downloads/{id}/fail", s.failDownload)
 	api.HandleFunc("GET /api/settings", s.settings)
@@ -178,14 +179,18 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	if st.Active == nil {
 		st.Active = []Progress{}
 	}
+	if st.Seeding == nil {
+		st.Seeding = []Progress{}
+	}
 	if st.Log == nil {
 		st.Log = []string{}
 	}
 	writeJSON(w, map[string]any{
-		"status":   st,
-		"recent":   recent,
-		"tmdb":     s.conf.Get().TMDBKey != "",
-		"indexers": len(s.conf.Get().Indexers),
+		"status":    st,
+		"recent":    recent,
+		"tmdb":      s.conf.Get().TMDBKey != "",
+		"indexers":  len(s.conf.Get().Indexers),
+		"seedRatio": s.conf.Get().SeedRatio,
 	})
 }
 
@@ -474,15 +479,66 @@ func (s *server) releases(w http.ResponseWriter, r *http.Request) {
 		Codec      string `json:"codec"`
 		Group      string `json:"group"`
 		Reject     string `json:"reject,omitempty"`
+		Link       string `json:"link"`
 	}
 	out := []candidateView{}
 	for _, c := range release.Rank(cfg.Quality, want, searchAll(r.Context(), cfg, want, collect), s.st.Blocked) {
 		out = append(out, candidateView{
 			c.Title, c.Indexer, c.Size, c.Seeders,
-			c.Info.Resolution, c.Info.Source, c.Info.Codec, c.Info.Group, c.Reject,
+			c.Info.Resolution, c.Info.Source, c.Info.Codec, c.Info.Group, c.Reject, c.Link,
 		})
 	}
 	writeJSON(w, map[string]any{"query": want.Query(), "errors": errs, "candidates": out})
+}
+
+// grabRelease downloads a release picked on the releases page, even one the
+// ranking rejected. It is for the same movie, episode or season (episode 0)
+// the page searched for, and covers those items that are not downloading
+// already. For a season, that is the episodes aired so far.
+func (s *server) grabRelease(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Media   int64  `json:"media"`
+		Season  int    `json:"season"`
+		Episode int    `json:"episode"`
+		Title   string `json:"title"`
+		Link    string `json:"link"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.Title == "" || req.Link == "" {
+		writeError(w, http.StatusBadRequest, errors.New("title and link are required"))
+		return
+	}
+	m, err := s.st.Media(req.Media)
+	if err != nil {
+		writeError(w, http.StatusNotFound, errors.New("not in the library"))
+		return
+	}
+	items, err := s.st.Items(m.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	today := time.Now().Format("2006-01-02")
+	var ids []int64
+	for _, it := range items {
+		covered := !m.IsShow() ||
+			it.Season == req.Season && (it.Episode == req.Episode ||
+				req.Episode == 0 && it.AirDate != "" && it.AirDate <= today)
+		if covered && it.State != store.Downloading {
+			ids = append(ids, it.ID)
+		}
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusConflict, errors.New("already downloading; mark that download as failed first"))
+		return
+	}
+	if err := s.run.Grab(r.Context(), ids, req.Title, req.Link); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Settings.
@@ -515,6 +571,7 @@ func (s *server) settings(w http.ResponseWriter, r *http.Request) {
 			Resolutions: nonNil(c.Quality.Resolutions), PreferCodecs: nonNil(c.Quality.PreferCodecs),
 			MaxMovieGB: c.Quality.MaxMovieGB, MaxEpisodeGB: c.Quality.MaxEpisodeGB, MinSeeders: c.Quality.MinSeeders,
 		},
+		"seedRatio":       c.SeedRatio,
 		"passwordSet":     live.Password != "",
 		"passwordFromEnv": config.FromEnv("password"),
 		// Shown for reference; these change in the config file and need a restart.
@@ -544,6 +601,8 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		TMDBKey  string        `json:"tmdbKey"`
 		Indexers []indexerView `json:"indexers"`
 		Quality  qualityView   `json:"quality"`
+		// nil leaves it as it is.
+		SeedRatio *float64 `json:"seedRatio"`
 		// nil leaves the password as it is; "" removes it.
 		Password *string `json:"password"`
 	}
@@ -566,6 +625,9 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		c.Quality = config.Quality{
 			Resolutions: req.Quality.Resolutions, PreferCodecs: req.Quality.PreferCodecs,
 			MaxMovieGB: req.Quality.MaxMovieGB, MaxEpisodeGB: req.Quality.MaxEpisodeGB, MinSeeders: req.Quality.MinSeeders,
+		}
+		if req.SeedRatio != nil {
+			c.SeedRatio = *req.SeedRatio
 		}
 		if req.Password != nil {
 			c.Password = *req.Password

@@ -9,6 +9,7 @@ interface Form {
   tmdbKey: string
   indexers: Indexer[]
   quality: Quality
+  seedRatio: number
   newPassword: string
   removePassword: boolean
 }
@@ -17,6 +18,7 @@ const toForm = (s: Settings): Form => ({
   tmdbKey: s.tmdbKey,
   indexers: s.indexers,
   quality: s.quality,
+  seedRatio: s.seedRatio,
   newPassword: '',
   removePassword: false,
 })
@@ -48,6 +50,7 @@ export default function SettingsPage() {
         tmdbKey: form.tmdbKey.trim(),
         indexers: form.indexers.map((ix) => ({ name: ix.name.trim(), url: ix.url.trim(), apiKey: ix.apiKey.trim() })),
         quality: form.quality,
+        seedRatio: form.seedRatio,
         password: form.removePassword ? '' : form.newPassword || undefined,
       }),
     )
@@ -122,6 +125,15 @@ export default function SettingsPage() {
             />
           </Field>
         </div>
+      </Section>
+
+      <Section title="Seeding" hint="Finished downloads keep seeding after they are imported.">
+        <Field
+          label="Seed ratio"
+          help="Stop seeding once a download has uploaded this many times its size. 0 seeds until unified stops."
+        >
+          <NumberInput value={form.seedRatio} onChange={(seedRatio) => update({ seedRatio })} />
+        </Field>
       </Section>
 
       <Section title="Login" hint="A password for this web interface. Any user name works.">

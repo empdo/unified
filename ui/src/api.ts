@@ -14,10 +14,14 @@ export interface Progress {
   total: number
   peers: number
   rate: number
+  /** Seeding downloads: bytes uploaded since unified started, and as a multiple of the size. */
+  uploaded: number
+  ratio: number
 }
 
 export interface Status {
   active: Progress[]
+  seeding: Progress[]
   log: string[]
   vpn: string
   vpnError: string
@@ -28,6 +32,7 @@ export interface StatusResponse {
   recent: { id: number; name: string; state: string }[]
   tmdb: boolean
   indexers: number
+  seedRatio: number
 }
 
 export interface MediaSummary {
@@ -75,6 +80,7 @@ export interface Candidate {
   codec: string
   group: string
   reject?: string
+  link: string
 }
 
 export interface Releases {
@@ -101,6 +107,8 @@ export interface Settings {
   tmdbKey: string
   indexers: Indexer[]
   quality: Quality
+  /** 0 means no limit. */
+  seedRatio: number
   passwordSet: boolean
   passwordFromEnv: boolean
   fixed: {
@@ -119,6 +127,7 @@ export interface SettingsUpdate {
   tmdbKey: string
   indexers: Indexer[]
   quality: Quality
+  seedRatio: number
   /** Omitted: unchanged. Empty string: remove the password. */
   password?: string
 }
@@ -162,6 +171,9 @@ export const api = {
   find: (kind: Kind, query: string) => request<FindResult[]>('GET', `api/find?${q({ kind, q: query })}`),
   releases: (media: number, season?: number, episode?: number) =>
     request<Releases>('GET', `api/releases?${q({ media, season, episode })}`),
+  /** Episode 0 grabs for a whole season; a movie needs neither. */
+  grab: (media: number, season: number, episode: number, c: Candidate) =>
+    request<void>('POST', 'api/releases/grab', { media, season, episode, title: c.title, link: c.link }),
   searchNow: () => request<void>('POST', 'api/search'),
   failDownload: (id: number) => request<void>('POST', `api/downloads/${id}/fail`),
   settings: () => request<Settings>('GET', 'api/settings'),

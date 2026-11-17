@@ -21,6 +21,9 @@ type Config struct {
 	TVDir       string `toml:"tv_dir"`
 	TMDBKey     string `toml:"tmdb_api_key"`
 	ListenPort  int    `toml:"listen_port"`
+	// Finished downloads stop seeding once they have uploaded this many times
+	// their size; 0 seeds for as long as unified runs.
+	SeedRatio float64 `toml:"seed_ratio"`
 	// Network interface all torrent traffic is bound to, e.g. "wg0-mullvad".
 	VPNInterface string `toml:"vpn_interface"`
 	// Password for the web UI; empty means no login.
@@ -59,6 +62,10 @@ tv_dir       = "%[2]s/tv"
 tmdb_api_key = ""
 
 listen_port = 42069
+
+# Stop seeding a finished download once it has uploaded this many times its
+# size. 0 keeps seeding for as long as unified runs.
+seed_ratio = 1.0
 
 # Bind all torrent traffic to this network interface, so it stops instead of
 # leaking if the VPN drops. The Mullvad app on Linux uses "wg0-mullvad"; run
@@ -147,6 +154,9 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("data_dir, download_dir, movies_dir and tv_dir must all be set")
 		}
 		*p = expandHome(*p)
+	}
+	if c.SeedRatio < 0 {
+		return fmt.Errorf("seed_ratio cannot be negative")
 	}
 	if len(c.Quality.Resolutions) == 0 {
 		c.Quality.Resolutions = []string{"1080p", "720p"}

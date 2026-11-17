@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -155,6 +156,76 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 	if s.conf.Get().TMDBKey != "k" {
 		t.Error("a refused save changed the config")
+	}
+}
+
+func TestGrabRelease(t *testing.T) {
+	s, h := newTestServer(t, "")
+	// Stand in for the runner loop: accept every grab and remember its items.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s.run.ctx, s.run.grabs = ctx, make(chan grabRequest)
+	got := make(chan []int64, 1)
+	go func() {
+		for g := range s.run.grabs {
+			got <- g.items
+			g.reply <- nil
+		}
+	}()
+
+	id, _ := s.st.AddMedia(store.Media{Kind: "show", TMDBID: 95396, Title: "Severance", Year: 2022})
+	s.st.UpsertItem(id, 1, 1, "", "2022-02-18", false)
+	s.st.UpsertItem(id, 1, 2, "", "2022-02-25", true)
+	s.st.UpsertItem(id, 1, 3, "", "2999-01-01", true) // not aired
+	s.st.UpsertItem(id, 2, 1, "", "2025-01-17", true)
+	items, _ := s.st.Items(id)
+	ids := map[[2]int]int64{}
+	for _, it := range items {
+		ids[[2]int{it.Season, it.Episode}] = it.ID
+	}
+
+	grab := func(season, episode int) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{"media": id, "season": season, "episode": episode, "title": "Severance.S01.1080p-GRP", "link": "magnet:?xt=urn:btih:x"})
+		return do(h, "POST", "/api/releases/grab", string(body), "")
+	}
+	if w := grab(1, 0); w.Code != 204 {
+		t.Fatalf("season grab: %d %s", w.Code, w.Body.String())
+	}
+	if g := <-got; len(g) != 2 || g[0] != ids[[2]int{1, 1}] || g[1] != ids[[2]int{1, 2}] {
+		t.Errorf("season grab covered %v, want the two aired episodes of season 1", g)
+	}
+	if w := grab(2, 1); w.Code != 204 {
+		t.Fatalf("episode grab: %d %s", w.Code, w.Body.String())
+	}
+	if g := <-got; len(g) != 1 || g[0] != ids[[2]int{2, 1}] {
+		t.Errorf("episode grab covered %v, want S02E01", g)
+	}
+
+	// An episode that is already downloading is left out.
+	if _, err := s.st.CreateDownload("abc", "x", "magnet:", []int64{ids[[2]int{2, 1}]}); err != nil {
+		t.Fatal(err)
+	}
+	if w := grab(2, 1); w.Code != 409 {
+		t.Errorf("grab of a downloading episode: %d, want 409", w.Code)
+	}
+}
+
+func TestSeedRatioSetting(t *testing.T) {
+	s, h := newTestServer(t, "")
+	body := `{"quality":{"resolutions":["1080p"]},"seedRatio":1.5}`
+	if w := do(h, "PUT", "/api/settings", body, ""); w.Code != 204 {
+		t.Fatalf("save: %d %s", w.Code, w.Body.String())
+	}
+	if got := s.conf.Get().SeedRatio; got != 1.5 {
+		t.Errorf("seed ratio = %v, want 1.5", got)
+	}
+	// Leaving it out keeps it; a negative ratio is refused.
+	do(h, "PUT", "/api/settings", `{"quality":{"resolutions":["1080p"]}}`, "")
+	if w := do(h, "PUT", "/api/settings", `{"quality":{"resolutions":["1080p"]},"seedRatio":-1}`, ""); w.Code != 400 {
+		t.Errorf("negative ratio: %d, want 400", w.Code)
+	}
+	if got := s.conf.Get().SeedRatio; got != 1.5 {
+		t.Errorf("seed ratio = %v after saves that should not change it, want 1.5", got)
 	}
 }
 

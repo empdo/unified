@@ -1,7 +1,8 @@
-import { api } from '../api'
+import { useState } from 'react'
+import { api, type Candidate } from '../api'
 import { Notice, Spinner } from '../components'
 import { bytes } from '../format'
-import { useData } from '../hooks'
+import { useAction, useData } from '../hooks'
 import { href } from '../router'
 
 export default function ReleasesPage({ params }: { params: URLSearchParams }) {
@@ -11,6 +12,14 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
   const releases = useData(() => api.releases(media, season, episode), [media, season, episode])
   const r = releases.data
   const accepted = r?.candidates.filter((c) => !c.reject).length ?? 0
+  const grab = useAction()
+  const [grabbed, setGrabbed] = useState<string>()
+
+  const pick = async (c: Candidate) => {
+    if (c.reject && !confirm(`This release was rejected: ${c.reject}. Grab it anyway?`)) return
+    setGrabbed(undefined)
+    if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c))) setGrabbed(c.title)
+  }
 
   return (
     <>
@@ -29,11 +38,17 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
           {e}
         </Notice>
       ))}
+      {grab.error && <Notice kind="error">Could not grab it: {grab.error}</Notice>}
+      {grabbed && (
+        <Notice>
+          Grabbed {grabbed}. Follow it on the <a href={href('/downloads')}>Downloads</a> page.
+        </Notice>
+      )}
       {r && (
         <>
           <p className="muted small">
             {r.candidates.length} found, {accepted} acceptable. When something is wanted, unified grabs the top
-            acceptable release by itself.
+            acceptable release by itself; Grab picks one yourself, even a rejected one.
           </p>
           <div className="table-wrap">
             <table className="releases">
@@ -43,6 +58,7 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
                   <th className="right">Size</th>
                   <th className="right">Seeds</th>
                   <th>Verdict</th>
+                  <th />
                 </tr>
               </thead>
               <tbody>
@@ -62,6 +78,11 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
                     <td className="right nowrap">{bytes(c.size)}</td>
                     <td className="right">{c.seeders >= 0 ? c.seeders : '?'}</td>
                     <td>{c.reject ? <span className="small">{c.reject}</span> : <span className="ok">Acceptable</span>}</td>
+                    <td>
+                      <button className="button small" disabled={grab.busy} onClick={() => pick(c)}>
+                        Grab
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>

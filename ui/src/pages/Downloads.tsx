@@ -1,5 +1,6 @@
 import { api } from '../api'
 import { Notice, ProgressBar, Spinner, StateBadge, progressText } from '../components'
+import { bytes, plural } from '../format'
 import { useAction } from '../hooks'
 import { href } from '../router'
 import { useStatus } from '../status'
@@ -53,6 +54,29 @@ export default function Downloads() {
           </div>
         ))}
       </section>
+
+      {s.seeding.length > 0 && (
+        <section>
+          <h2>Seeding</h2>
+          <p className="muted small">
+            {status.seedRatio > 0
+              ? `Each stops seeding at ratio ${status.seedRatio}, or when unified stops.`
+              : 'These seed until unified stops. Set a seed ratio in the settings to stop sooner.'}
+          </p>
+          <ul className="list">
+            {s.seeding.map((p) => (
+              <li key={p.id}>
+                <a href={href(`/media/${p.mediaId}`)} className="release-name">
+                  {p.name}
+                </a>
+                <span className="small muted nowrap">
+                  ratio {p.ratio.toFixed(2)} · {bytes(p.uploaded)} up · {plural(p.peers, 'peer')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {status.recent.length > 0 && (
         <section>

@@ -82,6 +82,11 @@ func Rank(q config.Quality, w Want, rels []torznab.Release, blocked func(name st
 		}
 		seen[r.Title] = true
 		c := Candidate{Release: r, Info: Parse(r.Title)}
+		// A title ending in a number, like "Blade Runner 2049", can be parsed
+		// as a shorter title and a year when the release has no real year.
+		if in := c.Info; in.Year != 0 && normalize(fmt.Sprintf("%s %d", in.Title, in.Year)) == normalize(w.Title) {
+			c.Info.Title, c.Info.Year = fmt.Sprintf("%s %d", in.Title, in.Year), 0
+		}
 		c.Reject, c.score = judge(q, w, c, blocked)
 		out = append(out, c)
 	}

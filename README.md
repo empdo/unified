@@ -14,7 +14,12 @@ every 30 minutes for wanted items still missing (including newly aired
 episodes). Don't run `unified run` at the same time.
 
 The UI has the library with posters, a page per movie or show, search, the
-releases found for anything, downloads with progress, and settings. Indexers,
+releases found for anything (Grab downloads one of them yourself, even one
+the ranking rejected), downloads with progress, and settings.
+
+Finished downloads keep seeding until they have uploaded `seed_ratio` times
+their size (0: no limit), or until unified stops; seeding does not resume
+after a restart. Indexers,
 the TMDB key, quality rules and the password can be changed there and apply
 at once; saving rewrites the config file (without its comments).
 
