@@ -68,6 +68,8 @@ export interface Status {
   vpn: string
   vpnError: string
   disk: DiskStatus
+  /** What is being searched for on the indexers, and how many wanted items wait for a search. */
+  search: { current: { mediaId: number; label: string } | null; queued: number }
 }
 
 export interface StatusResponse {
@@ -97,6 +99,10 @@ export interface Item {
   airDate: string
   state: ItemState
   path?: string
+  /** The download bringing it, while it is downloading. */
+  downloadId?: number
+  /** Where the search for it stands, while it is wanted. */
+  search?: { state: 'queued' | 'searching' | 'notFound'; at: string; note?: string }
 }
 
 export interface MediaDetail extends MediaSummary {
@@ -220,6 +226,12 @@ export const api = {
   wantSeason: (id: number, season: number, want: boolean) =>
     request<void>('POST', `api/media/${id}/seasons/${season}`, { want }),
   wantItem: (id: number, want: boolean) => request<void>('POST', `api/items/${id}`, { want }),
+  /** Deletes a season's episode files, stopping their downloads, and stops wanting them. */
+  deleteSeasonFiles: (id: number, season: number) => request<void>('DELETE', `api/media/${id}/seasons/${season}/files`),
+  /** Stops a season's downloads, deleting what they downloaded, and stops wanting its missing episodes. */
+  cancelSeason: (id: number, season: number) => request<void>('POST', `api/media/${id}/seasons/${season}/cancel`),
+  /** Deletes one episode's file, and stops wanting it. */
+  deleteItemFiles: (id: number) => request<void>('DELETE', `api/items/${id}/files`),
   find: (kind: Kind, query: string) => request<FindResult[]>('GET', `api/find?${q({ kind, q: query })}`),
   releases: (media: number, season?: number, episode?: number) =>
     request<Releases>('GET', `api/releases?${q({ media, season, episode })}`),

@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { api, type Item, type MediaDetail } from './api'
-import { Notice, StateBadge } from './components'
+import { api, type Item, type MediaDetail, type Progress } from './api'
+import { Notice } from './components'
 import { airDate, episodeCode, plural } from './format'
+import { ItemStatus } from './itemstate'
 import { useAction } from './hooks'
 import { href } from './router'
 
@@ -17,8 +18,8 @@ function defaultSeason(seasons: Season[]): Season {
 }
 
 /** Season tabs plus the chosen season's episodes. */
-export function ShowSeasons(props: { media: MediaDetail; reload: () => void }) {
-  const { media, reload } = props
+export function ShowSeasons(props: { media: MediaDetail; downloads: Progress[]; reload: () => void }) {
+  const { media, downloads, reload } = props
   const [picked, setPicked] = useState<number>()
   if (media.seasons.length === 0) return <p className="muted">TMDB lists no episodes for this show yet.</p>
   const current = media.seasons.find((s) => s.number === picked) ?? defaultSeason(media.seasons)
@@ -41,13 +42,13 @@ export function ShowSeasons(props: { media: MediaDetail; reload: () => void }) {
           ))}
         </div>
       )}
-      <SeasonPanel key={current.number} media={media} season={current} reload={reload} />
+      <SeasonPanel key={current.number} media={media} season={current} downloads={downloads} reload={reload} />
     </>
   )
 }
 
-function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => void }) {
-  const { media, season, reload } = props
+function SeasonPanel(props: { media: MediaDetail; season: Season; downloads: Progress[]; reload: () => void }) {
+  const { media, season, downloads, reload } = props
   const action = useAction()
   const count = (state: string) => season.episodes.filter((e) => e.state === state).length
   const total = season.episodes.length
@@ -70,6 +71,25 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => 
   const setSeason = (want: boolean) => action.run(() => api.wantSeason(media.id, season.number, want)).then(reload)
   const setEpisode = (e: Item, want: boolean) => action.run(() => api.wantItem(e.id, want)).then(reload)
 
+  const onDisk = imported + downloading
+  const deleteSeason = () => {
+    const what = [imported > 0 && plural(imported, 'episode file'), downloading > 0 && plural(downloading, 'download')]
+      .filter(Boolean)
+      .join(' and ')
+    if (!confirm(`Delete ${what} of ${seasonName(season.number)}? The episodes won't be downloaded again unless you ask for them.`)) return
+    action.run(() => api.deleteSeasonFiles(media.id, season.number)).then(reload)
+  }
+  const cancelSeason = () => {
+    const rest = wanted > 0 ? ` and stop wanting its other ${plural(wanted, 'missing episode')}` : ''
+    if (!confirm(`Cancel the ${plural(downloading, 'downloading episode')} of ${seasonName(season.number)}${rest}? What was downloaded so far is deleted; episodes in your library stay.`)) return
+    action.run(() => api.cancelSeason(media.id, season.number)).then(reload)
+  }
+  const deleteEpisode = (e: Item) => {
+    const what = e.state === 'downloading' ? 'Stop downloading' : 'Delete the file of'
+    if (!confirm(`${what} ${episodeCode(e.season, e.episode)}? It won't be downloaded again unless you ask for it.`)) return
+    action.run(() => api.deleteItemFiles(e.id)).then(reload)
+  }
+
   return (
     <div className="season">
       <div className="season-head">
@@ -81,14 +101,25 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => 
           <a className="button" href={href(`/releases?media=${media.id}&season=${season.number}`)}>
             Season releases
           </a>
-          {wanted > 0 && (
-            <button className="button" disabled={action.busy} onClick={() => setSeason(false)}>
-              Stop wanting season
+          {downloading > 0 ? (
+            <button className="button" disabled={action.busy} onClick={cancelSeason}>
+              Cancel downloads
             </button>
+          ) : (
+            wanted > 0 && (
+              <button className="button" disabled={action.busy} onClick={() => setSeason(false)}>
+                Stop wanting season
+              </button>
+            )
           )}
           {ignored > 0 && (
             <button className="button ink" disabled={action.busy} onClick={() => setSeason(true)}>
               Download whole season
+            </button>
+          )}
+          {onDisk > 0 && (
+            <button className="button danger" disabled={action.busy} onClick={deleteSeason}>
+              Delete season files
             </button>
           )}
         </div>
@@ -101,7 +132,7 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => 
             <span className="ep-title">{e.title || <span className="muted">Title not announced</span>}</span>
             <span className="ep-date">{airDate(e.airDate) || 'Date TBA'}</span>
             <span className="ep-state">
-              <StateBadge state={e.state} />
+              <ItemStatus item={e} download={downloads.find((p) => p.id === e.downloadId)} />
             </span>
             <span className="ep-actions">
               {e.state === 'ignored' && (
@@ -114,6 +145,11 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => 
                   Stop wanting
                 </button>
               )}
+              {(e.state === 'imported' || e.state === 'downloading') && (
+                <button className="button small danger" disabled={action.busy} onClick={() => deleteEpisode(e)}>
+                  {e.state === 'downloading' ? 'Cancel' : 'Delete'}
+                </button>
+              )}
               <a className="link" href={href(`/releases?media=${media.id}&season=${e.season}&episode=${e.episode}`)}>
                 Releases
               </a>
@@ -124,3 +160,4 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; reload: () => 
     </div>
   )
 }
+

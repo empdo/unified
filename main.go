@@ -400,23 +400,34 @@ func sceneWant(m store.Media, items []store.Item, season, episode int) release.W
 
 // searchAll queries every configured indexer, reporting failures through
 // logf without giving up on the others.
-func searchAll(ctx context.Context, cfg *config.Config, w release.Want, logf func(string, ...any)) []torznab.Release {
+// searchAll searches every indexer for w, and reports whether any of them
+// answered. Indexers that health says are down are skipped, and those that
+// fail are recorded there.
+func searchAll(ctx context.Context, cfg *config.Config, w release.Want, logf func(string, ...any), health *indexerHealth) (all []torznab.Release, answered bool) {
 	category := torznab.Movies
 	if w.Show {
 		category = torznab.TV
 	}
-	var all []torznab.Release
 	for _, q := range w.Queries() {
 		for _, ix := range cfg.Indexers {
-			rels, err := torznab.Search(ctx, ix, q, category)
-			if err != nil {
-				logf("  indexer error: %v", err)
+			if _, down := health.down(ix.Name); down {
 				continue
 			}
+			rels, err := torznab.Search(ctx, ix, q, category)
+			if err != nil {
+				until := health.fail(ix.Name, err)
+				if health != nil {
+					logf("  indexer error: %v (not asking it again until %s)", err, until.Format("15:04"))
+				} else {
+					logf("  indexer error: %v", err)
+				}
+				continue
+			}
+			answered = true
 			all = append(all, rels...)
 		}
 	}
-	return all
+	return all, answered
 }
 
 func cmdSearch(ctx context.Context, cfg *config.Config, st *store.Store, args []string) error {
@@ -447,7 +458,8 @@ func cmdSearch(ctx context.Context, cfg *config.Config, st *store.Store, args []
 	}
 	fmt.Printf("searching for %q\n", w.Query())
 	stderr := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
-	cands := release.Rank(cfg.Quality, w, searchAll(ctx, cfg, w, stderr), st.Blocked)
+	rels, _ := searchAll(ctx, cfg, w, stderr, nil)
+	cands := release.Rank(cfg.Quality, w, rels, st.Blocked)
 	for _, c := range cands {
 		verdict := "ok"
 		if c.Reject != "" {

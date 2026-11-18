@@ -87,7 +87,10 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("DELETE /api/media/{id}", s.removeMedia)
 	api.HandleFunc("DELETE /api/media/{id}/files", s.deleteFiles)
 	api.HandleFunc("POST /api/media/{id}/seasons/{season}", s.wantSeason)
+	api.HandleFunc("DELETE /api/media/{id}/seasons/{season}/files", s.deleteSeasonFiles)
+	api.HandleFunc("POST /api/media/{id}/seasons/{season}/cancel", s.cancelSeason)
 	api.HandleFunc("POST /api/items/{id}", s.wantItem)
+	api.HandleFunc("DELETE /api/items/{id}/files", s.deleteItemFiles)
 	api.HandleFunc("GET /api/find", s.find)
 	api.HandleFunc("GET /api/releases", s.releases)
 	api.HandleFunc("POST /api/releases/grab", s.grabRelease)
@@ -270,6 +273,10 @@ type itemView struct {
 	AirDate string `json:"airDate"`
 	State   string `json:"state"`
 	Path    string `json:"path,omitempty"`
+	// The download bringing it, while it is downloading.
+	DownloadID int64 `json:"downloadId,omitempty"`
+	// Where the search for it stands, while it is wanted.
+	Search *ItemSearch `json:"search,omitempty"`
 }
 
 type seasonView struct {
@@ -299,8 +306,15 @@ func (s *server) media(w http.ResponseWriter, r *http.Request) {
 		Movie   *itemView    `json:"movie,omitempty"`
 		Seasons []seasonView `json:"seasons"`
 	}{mediaView: v, Seasons: []seasonView{}}
+	searches := s.run.Searches()
 	for _, it := range items {
-		iv := itemView{it.ID, it.Season, it.Episode, it.Title, it.AirDate, it.State, it.Path}
+		iv := itemView{ID: it.ID, Season: it.Season, Episode: it.Episode, Title: it.Title, AirDate: it.AirDate, State: it.State, Path: it.Path}
+		if it.State == store.Downloading {
+			iv.DownloadID = it.Download.Int64
+		}
+		if search, ok := searches[it.ID]; ok && it.State == store.Wanted {
+			iv.Search = &search
+		}
 		if !m.IsShow() {
 			out.Movie = &iv
 			break
@@ -364,6 +378,92 @@ func (s *server) remove(w http.ResponseWriter, r *http.Request, deleteFiles, fro
 		return
 	}
 	if err := s.run.Remove(r.Context(), id, deleteFiles, fromLibrary); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteSeasonFiles deletes the files of a season's episodes and stops
+// wanting them.
+func (s *server) deleteSeasonFiles(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	season, ok := pathID(w, r, "season")
+	if !ok {
+		return
+	}
+	items, err := s.st.Items(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var ids []int64
+	for _, it := range items {
+		if it.Season == int(season) {
+			ids = append(ids, it.ID)
+		}
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusNotFound, errors.New("no such season"))
+		return
+	}
+	if err := s.run.DeleteItems(r.Context(), id, ids); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// cancelSeason stops the season's running downloads and stops wanting its
+// missing episodes. Episodes in the library stay.
+func (s *server) cancelSeason(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	season, ok := pathID(w, r, "season")
+	if !ok {
+		return
+	}
+	items, err := s.st.Items(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var downloading []int64
+	for _, it := range items {
+		if it.Season == int(season) && it.State == store.Downloading {
+			downloading = append(downloading, it.ID)
+		}
+	}
+	// First, so nothing new is grabbed for the season meanwhile.
+	if err := s.st.SetSeasonWanted(id, int(season), false); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.run.CancelItems(r.Context(), id, downloading); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteItemFiles deletes the file of one episode or movie and stops wanting
+// it.
+func (s *server) deleteItemFiles(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	it, err := s.st.Item(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, errors.New("no such episode"))
+		return
+	}
+	if err := s.run.DeleteItems(r.Context(), it.MediaID, []int64{id}); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -510,7 +610,8 @@ func (s *server) releases(w http.ResponseWriter, r *http.Request) {
 		Link       string `json:"link"`
 	}
 	out := []candidateView{}
-	for _, c := range release.Rank(cfg.Quality, want, searchAll(r.Context(), cfg, want, collect), s.st.Blocked) {
+	rels, _ := searchAll(r.Context(), cfg, want, collect, nil)
+	for _, c := range release.Rank(cfg.Quality, want, rels, s.st.Blocked) {
 		out = append(out, candidateView{
 			c.Title, c.Indexer, c.Size, c.Seeders,
 			c.Info.Resolution, c.Info.Source, c.Info.Codec, c.Info.Group, c.Reject, c.Link,

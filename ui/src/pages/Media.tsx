@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { api, type Item, type MediaDetail } from '../api'
-import { Notice, Poster, ProgressBar, Spinner, StateBadge, progressText } from '../components'
+import { Notice, Poster, ProgressBar, Spinner, progressText } from '../components'
 import { plural } from '../format'
 import { useAction, useData } from '../hooks'
 import { href, navigate } from '../router'
+import { ItemStatus } from '../itemstate'
 import { ShowSeasons } from '../seasons'
 import { useActiveByMedia } from '../status'
 
@@ -32,7 +33,7 @@ export default function MediaPage({ id }: { id: number }) {
           </h1>
           {m.overview && <p className="overview">{m.overview}</p>}
           {m.movie && <MovieStatus item={m.movie} />}
-          {downloads.map((p) => (
+          {m.movie && downloads.map((p) => (
             <div className="download-inline" key={p.id}>
               <div className="small muted">{p.name}</div>
               <ProgressBar percent={p.percent} />
@@ -55,7 +56,7 @@ export default function MediaPage({ id }: { id: number }) {
       </section>
       {m.kind === 'show' && (
         <section className="media-seasons">
-          <ShowSeasons media={m} reload={media.reload} />
+          <ShowSeasons media={m} downloads={downloads} reload={media.reload} />
         </section>
       )}
     </>
@@ -127,7 +128,7 @@ function RemovePanel(props: { media: MediaDetail; downloading: number; close: ()
 function MovieStatus({ item }: { item: Item }) {
   return (
     <div className="movie-status">
-      <StateBadge state={item.state} />
+      <ItemStatus item={item} />
       {item.path && <code className="path">{item.path}</code>}
     </div>
   )

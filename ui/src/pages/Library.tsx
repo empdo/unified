@@ -74,17 +74,34 @@ function Tonight({ titles }: { titles: Map<number, string> }) {
   const action = useAction()
   if (!status) return null
   const active = status.status.active
-  const shown = active.slice(0, 3)
+  const search = status.status.search
+  const shown = active.slice(0, search.current ? 2 : 3)
+  const waiting = search.queued > 0 ? `${search.queued} more waiting` : ''
 
   return (
     <section className="tonight" aria-label="Downloading now">
       <div className="tonight-label">
         <span className="tonight-title">Tonight</span>
         <span className="small">
-          {active.length === 0 ? 'Nothing downloading' : `${plural(active.length, 'download')} running`}
+          {active.length > 0
+            ? `${plural(active.length, 'download')} running`
+            : search.current
+              ? 'Looking for releases'
+              : 'Nothing downloading'}
         </span>
       </div>
       <div className="tonight-items">
+        {search.current && (
+          <a className="tonight-item" href={href(`/media/${search.current.mediaId}`)}>
+            <span className="tonight-name">
+              <span>{search.current.label}</span>
+            </span>
+            <div className="bar bar-indeterminate" aria-hidden="true">
+              <div />
+            </div>
+            <span className="tonight-meta">{['Searching the indexers…', waiting].filter(Boolean).join(' · ')}</span>
+          </a>
+        )}
         {shown.map((p) => (
           <a key={p.id} className="tonight-item" href={href(`/media/${p.mediaId}`)}>
             <span className="tonight-name">

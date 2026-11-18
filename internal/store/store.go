@@ -384,6 +384,51 @@ func (s *Store) ClearItems(mediaID int64) error {
 	return err
 }
 
+// ClearItemsByID forgets the files of some items and stops wanting them,
+// after their files were deleted from disk.
+func (s *Store) ClearItemsByID(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE items SET state = ?, path = '', download_id = NULL WHERE id = ?`, Ignored, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// CancelItems stops wanting items whose downloads were cancelled. Items
+// that were being replaced keep the file they had.
+func (s *Store) CancelItems(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE items SET state = CASE WHEN path != '' THEN ? ELSE ? END, download_id = NULL WHERE id = ?`,
+			Imported, Ignored, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Item returns one item.
+func (s *Store) Item(id int64) (Item, error) {
+	items, err := s.queryItems(`id = ?`, id)
+	if err != nil {
+		return Item{}, err
+	}
+	if len(items) == 0 {
+		return Item{}, sql.ErrNoRows
+	}
+	return items[0], nil
+}
+
 // FailDownload blocklists the release and returns its items to wanted.
 func (s *Store) FailDownload(id int64) error {
 	return s.closeDownload(id, Failed, true)

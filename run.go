@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -81,6 +82,8 @@ type runner struct {
 	exhausted map[int64]bool
 	// Print a progress line per download every tick (terminal mode).
 	printProgress bool
+	// Indexers that failed recently are skipped for a while.
+	indexers indexerHealth
 
 	wake    chan struct{}
 	fails   chan int64
@@ -94,16 +97,40 @@ type runner struct {
 	vpn      string // interface and addresses, "" when not bound
 	vpnErr   string
 	disk     DiskStatus
+	// Where the search for each wanted item stands, by item, and what is
+	// being searched for right now.
+	searches  map[int64]ItemSearch
+	searching *SearchView
+}
+
+// ItemSearch is where the search for a wanted item stands.
+type ItemSearch struct {
+	State string    `json:"state"` // queued, searching or notFound
+	At    time.Time `json:"at"`
+	Note  string    `json:"note,omitempty"` // why nothing was grabbed
+}
+
+// SearchView is a search in progress, for the web UI.
+type SearchView struct {
+	MediaID int64  `json:"mediaId"`
+	Label   string `json:"label"` // "Severance S02E03"
+}
+
+// SearchStatus is what is being searched for, and how many items wait.
+type SearchStatus struct {
+	Current *SearchView `json:"current"`
+	Queued  int         `json:"queued"`
 }
 
 // Status is what the web UI shows about the runner.
 type Status struct {
-	Active  []Progress `json:"active"`
-	Seeding []Progress `json:"seeding"`
-	Log     []string   `json:"log"` // newest first
-	VPN     string     `json:"vpn"`
-	VPNErr  string     `json:"vpnError"`
-	Disk    DiskStatus `json:"disk"`
+	Active  []Progress   `json:"active"`
+	Seeding []Progress   `json:"seeding"`
+	Log     []string     `json:"log"` // newest first
+	VPN     string       `json:"vpn"`
+	VPNErr  string       `json:"vpnError"`
+	Disk    DiskStatus   `json:"disk"`
+	Search  SearchStatus `json:"search"`
 }
 
 // DiskStatus is the free space for downloads and the library.
@@ -129,6 +156,7 @@ func newRunner(ctx context.Context, cfg func() *config.Config, st *store.Store) 
 		active:    map[int64]*activeDownload{},
 		seeding:   map[int64]*activeDownload{},
 		exhausted: map[int64]bool{},
+		searches:  map[int64]ItemSearch{},
 		wake:      make(chan struct{}, 1),
 		fails:     make(chan int64, 16),
 		grabs:     make(chan grabRequest),
@@ -199,16 +227,45 @@ func (r *runner) Grab(ctx context.Context, items []int64, title, link string) er
 }
 
 type removeRequest struct {
-	media                    int64
+	media int64
+	// Only these items of it: their files are deleted and they are no
+	// longer wanted. Nil means all of it.
+	items                    []int64
 	deleteFiles, fromLibrary bool
-	reply                    chan error
+	// With items: only stop their downloads, keeping files in the library.
+	cancel bool
+	reply  chan error
 }
 
 // Remove stops the downloads of a movie or show. With deleteFiles it also
 // deletes its files, from the library and the download directory, and stops
 // wanting it; with fromLibrary it is removed from the library.
 func (r *runner) Remove(ctx context.Context, media int64, deleteFiles, fromLibrary bool) error {
-	req := removeRequest{media, deleteFiles, fromLibrary, make(chan error, 1)}
+	return r.request(ctx, removeRequest{media: media, deleteFiles: deleteFiles, fromLibrary: fromLibrary})
+}
+
+// DeleteItems deletes the files of some episodes of a show and stops wanting
+// them. Their downloads are stopped, unless a download still running also
+// brings other episodes; then only those are imported when it finishes.
+func (r *runner) DeleteItems(ctx context.Context, media int64, items []int64) error {
+	if len(items) == 0 {
+		return nil
+	}
+	return r.request(ctx, removeRequest{media: media, items: items, deleteFiles: true})
+}
+
+// CancelItems stops the downloads of some items and stops wanting them,
+// deleting what was downloaded. Files in the library stay. A download that
+// also brings other items keeps running for those.
+func (r *runner) CancelItems(ctx context.Context, media int64, items []int64) error {
+	if len(items) == 0 {
+		return nil
+	}
+	return r.request(ctx, removeRequest{media: media, items: items, cancel: true})
+}
+
+func (r *runner) request(ctx context.Context, req removeRequest) error {
+	req.reply = make(chan error, 1)
 	select {
 	case r.removes <- req:
 	case <-ctx.Done():
@@ -225,6 +282,9 @@ func (r *runner) Remove(ctx context.Context, media int64, deleteFiles, fromLibra
 }
 
 func (r *runner) remove(req removeRequest) error {
+	if req.items != nil {
+		return r.removeItems(req)
+	}
 	var downloaded []string
 	stop := func(a *activeDownload) {
 		if req.deleteFiles && engine.HasInfo(a.t) {
@@ -284,9 +344,124 @@ func (r *runner) remove(req removeRequest) error {
 	return nil
 }
 
+// removeItems deletes the files of some items of a movie or show.
+func (r *runner) removeItems(req removeRequest) error {
+	removing := map[int64]bool{}
+	for _, id := range req.items {
+		removing[id] = true
+	}
+	// covers reports whether a download brings any of the items, and whether
+	// it brings nothing else.
+	covers := func(a *activeDownload) (some, only bool, err error) {
+		items, err := r.st.DownloadItems(a.dl.ID)
+		if err != nil {
+			return false, false, err
+		}
+		only = len(items) > 0
+		for _, it := range items {
+			if removing[it.ID] {
+				some = true
+			} else {
+				only = false
+			}
+		}
+		return some, only, nil
+	}
+	var downloaded []string
+	files := func(a *activeDownload) {
+		if engine.HasInfo(a.t) {
+			for _, f := range a.t.Files() {
+				downloaded = append(downloaded, filepath.Join(r.cfg().DownloadDir, f.Path()))
+			}
+		}
+	}
+	for id, a := range r.active {
+		some, only, err := covers(a)
+		if err != nil {
+			return err
+		}
+		if some && only {
+			files(a)
+			a.t.Drop()
+			delete(r.active, id)
+			if err := r.st.CancelDownload(id); err != nil {
+				return err
+			}
+		}
+	}
+	// A seeding torrent loses the files of the removed items, so it stops;
+	// the files of other items stay, as when it reaches the seed ratio.
+	// Cancelling leaves finished downloads alone.
+	for id, a := range r.seeding {
+		if req.cancel {
+			break
+		}
+		some, only, err := covers(a)
+		if err != nil {
+			return err
+		}
+		if some {
+			if only {
+				files(a)
+			}
+			a.t.Drop()
+			delete(r.seeding, id)
+		}
+	}
+	defer r.publish()
+
+	m, err := r.st.Media(req.media)
+	if err != nil {
+		return err
+	}
+	all, err := r.st.Items(m.ID)
+	if err != nil {
+		return err
+	}
+	var items []store.Item
+	var library []string
+	for _, it := range all {
+		if removing[it.ID] {
+			items = append(items, it)
+			if it.Path != "" && !req.cancel {
+				library = append(library, it.Path)
+			}
+		}
+	}
+	if req.cancel {
+		deleteErr := importer.Delete(r.cfg(), nil, downloaded)
+		if err := r.st.CancelItems(req.items); err != nil {
+			return err
+		}
+		if deleteErr != nil {
+			r.logf("cancelling the downloads of %s: %v", describe(m, items), deleteErr)
+			return deleteErr
+		}
+		r.logf("cancelled the downloads of %s", describe(m, items))
+		return nil
+	}
+	deleteErr := importer.Delete(r.cfg(), library, downloaded)
+	// Whatever could not be deleted, nothing should be downloaded again.
+	if err := r.st.ClearItemsByID(req.items); err != nil {
+		return err
+	}
+	if deleteErr != nil {
+		r.logf("deleting the files of %s: %v", describe(m, items), deleteErr)
+		return deleteErr
+	}
+	r.logf("deleted the files of %s", describe(m, items))
+	return nil
+}
+
 func (r *runner) Snapshot() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	queued := 0
+	for _, s := range r.searches {
+		if s.State == "queued" {
+			queued++
+		}
+	}
 	lines := make([]string, len(r.lines))
 	for i, l := range r.lines {
 		lines[len(lines)-1-i] = l
@@ -294,6 +469,28 @@ func (r *runner) Snapshot() Status {
 	return Status{
 		Active: append([]Progress(nil), r.snapshot...), Seeding: append([]Progress(nil), r.seeds...),
 		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr, Disk: r.disk,
+		Search: SearchStatus{Current: r.searching, Queued: queued},
+	}
+}
+
+// Searches returns where the searches for wanted items stand, by item.
+func (r *runner) Searches() map[int64]ItemSearch {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.searches)
+}
+
+// setSearch records where the search for some items stands; an empty state
+// forgets them.
+func (r *runner) setSearch(items []store.Item, state, note string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, it := range items {
+		if state == "" {
+			delete(r.searches, it.ID)
+		} else {
+			r.searches[it.ID] = ItemSearch{State: state, At: time.Now(), Note: note}
+		}
 	}
 }
 
@@ -612,10 +809,12 @@ func (r *runner) grabWanted() error {
 	}
 	if len(wanted) > 0 && len(r.cfg().Indexers) == 0 {
 		r.logf("%d items wanted, but no indexers are configured", len(wanted))
+		r.setSearch(wanted, "notFound", "No indexers are set up")
 		return nil
 	}
 	if len(wanted) > 0 && !r.checkDisk() {
 		r.logf("%d items wanted, but disk space is low; not searching", len(wanted))
+		r.setSearch(wanted, "notFound", "Low on disk space")
 		return nil
 	}
 	type seasonKey struct {
@@ -634,16 +833,42 @@ func (r *runner) grabWanted() error {
 			order = append(order, k)
 		}
 		groups[k] = append(groups[k], it)
+		r.setSearch([]store.Item{it}, "queued", "")
 	}
+	// Whatever was not reached, as when unified stops, is not waiting.
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for id, s := range r.searches {
+			if s.State == "queued" || s.State == "searching" {
+				delete(r.searches, id)
+			}
+		}
+	}()
 
-	for _, k := range order {
+	var names []string
+	for _, ix := range r.cfg().Indexers {
+		names = append(names, ix.Name)
+	}
+	for i, k := range order {
+		// With every indexer failing, the rest wait until one is back.
+		if until, down := r.indexers.allDown(names); down {
+			var rest []store.Item
+			for _, k := range order[i:] {
+				rest = append(rest, groups[k]...)
+			}
+			r.logf("no indexer can be searched until %s; %d items wait until then", until.Format("15:04"), len(rest))
+			r.setSearch(rest, "notFound", "Indexers unavailable until "+until.Format("15:04"))
+			time.AfterFunc(time.Until(until)+5*time.Second, r.Wake)
+			return nil
+		}
 		items := groups[k]
 		m, err := r.st.Media(k.media)
 		if err != nil {
 			return err
 		}
 		if !m.IsShow() {
-			if !r.grab(items, sceneWant(m, nil, 0, 0)) {
+			if !r.grab(m, items, sceneWant(m, nil, 0, 0)) {
 				r.exhausted[items[0].ID] = true
 			}
 			continue
@@ -653,12 +878,16 @@ func (r *runner) grabWanted() error {
 			return err
 		}
 		pack := sceneWant(m, all, k.season, 0)
-		if len(items) > 1 && len(items) == pack.Count && r.grab(items, pack) {
-			continue
+		if len(items) > 1 && len(items) == pack.Count {
+			if r.grab(m, items, pack) {
+				continue
+			}
+			// No season pack; the episodes are searched one by one.
+			r.setSearch(items, "queued", "")
 		}
 		for _, it := range items {
 			season, episode := it.Scene()
-			if !r.grab([]store.Item{it}, sceneWant(m, all, season, episode)) {
+			if !r.grab(m, []store.Item{it}, sceneWant(m, all, season, episode)) {
 				r.exhausted[it.ID] = true
 			}
 		}
@@ -667,13 +896,34 @@ func (r *runner) grabWanted() error {
 }
 
 // grab searches for w and starts the best release that can be added.
-func (r *runner) grab(items []store.Item, w release.Want) bool {
+func (r *runner) grab(m store.Media, items []store.Item, w release.Want) (ok bool) {
 	if r.ctx.Err() != nil {
 		return false
 	}
+	r.setSearch(items, "searching", "")
+	r.mu.Lock()
+	r.searching = &SearchView{MediaID: m.ID, Label: describe(m, items)}
+	r.mu.Unlock()
+	note := "No acceptable release found"
+	defer func() {
+		r.mu.Lock()
+		r.searching = nil
+		r.mu.Unlock()
+		if ok {
+			r.setSearch(items, "", "")
+		} else {
+			r.setSearch(items, "notFound", note)
+		}
+	}()
 	r.logf("searching: %s", w.Query())
-	cands := release.Rank(r.cfg().Quality, w, searchAll(r.ctx, r.cfg(), w, r.logf), r.st.Blocked)
+	rels, answered := searchAll(r.ctx, r.cfg(), w, r.logf, &r.indexers)
 	time.Sleep(time.Second) // go easy on the indexers
+	if !answered {
+		note = "No indexer could be searched"
+		r.logf("  no indexer could be searched")
+		return false
+	}
+	cands := release.Rank(r.cfg().Quality, w, rels, r.st.Blocked)
 
 	ids := make([]int64, len(items))
 	for i, it := range items {
@@ -698,6 +948,7 @@ func (r *runner) grab(items []store.Item, w release.Want) bool {
 		return true
 	}
 	if tooBig > 0 {
+		note = "Releases found would leave too little free space"
 		r.logf("  %d acceptable releases would leave less than %s free", tooBig, engine.Size(int64(r.minFree())))
 	} else {
 		r.logf("  no acceptable release found")
