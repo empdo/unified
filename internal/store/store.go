@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS media (
 	year    INTEGER NOT NULL,
 	poster   TEXT NOT NULL DEFAULT '',  -- TMDB image path, e.g. /abc.jpg
 	overview TEXT NOT NULL DEFAULT '',
+	aliases  TEXT NOT NULL DEFAULT '',  -- other release titles, one per line
 	UNIQUE (kind, tmdb_id)
 );
 -- A movie has exactly one item (season 0, episode 0); a show has one per episode.
@@ -49,6 +50,9 @@ CREATE TABLE IF NOT EXISTS items (
 	state       TEXT NOT NULL,
 	download_id INTEGER,
 	path        TEXT NOT NULL DEFAULT '',
+	-- How releases number the episode, when that differs from TMDB; 0 otherwise.
+	scene_season  INTEGER NOT NULL DEFAULT 0,
+	scene_episode INTEGER NOT NULL DEFAULT 0,
 	UNIQUE (media_id, season, episode)
 );
 CREATE TABLE IF NOT EXISTS downloads (
@@ -69,6 +73,7 @@ type Media struct {
 	Year     int
 	Poster   string
 	Overview string
+	Aliases  []string
 }
 
 func (m Media) IsShow() bool { return m.Kind == "show" }
@@ -83,6 +88,18 @@ type Item struct {
 	State    string
 	Path     string
 	Download sql.NullInt64
+	// The numbering releases use when it differs from TMDB's; see Scene.
+	SceneSeason  int
+	SceneEpisode int
+}
+
+// Scene returns the season and episode releases use for the item, which are
+// TMDB's unless the show has a scene mapping.
+func (i Item) Scene() (season, episode int) {
+	if i.SceneSeason == 0 && i.SceneEpisode == 0 {
+		return i.Season, i.Episode
+	}
+	return i.SceneSeason, i.SceneEpisode
 }
 
 type Download struct {
@@ -116,23 +133,19 @@ func Open(dataDir string) (*Store, error) {
 
 // migrate adds columns that databases created by older versions lack.
 func migrate(db *sql.DB) error {
-	cols := map[string]bool{}
-	rows, err := db.Query(`SELECT name FROM pragma_table_info('media')`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
+	for _, c := range []struct{ table, col, def string }{
+		{"media", "poster", `TEXT NOT NULL DEFAULT ''`},
+		{"media", "overview", `TEXT NOT NULL DEFAULT ''`},
+		{"media", "aliases", `TEXT NOT NULL DEFAULT ''`},
+		{"items", "scene_season", `INTEGER NOT NULL DEFAULT 0`},
+		{"items", "scene_episode", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.col).Scan(&n); err != nil {
 			return err
 		}
-		cols[name] = true
-	}
-	rows.Close()
-	for _, col := range []string{"poster", "overview"} {
-		if !cols[col] {
-			if _, err := db.Exec(`ALTER TABLE media ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.col + ` ` + c.def); err != nil {
 				return err
 			}
 		}
@@ -203,11 +216,39 @@ func (s *Store) SetItemWanted(itemID int64, want bool) error {
 	return err
 }
 
-const mediaCols = `id, kind, tmdb_id, title, year, poster, overview`
+// SetScene records how releases name a show: other titles, and for each
+// episode (keyed by TMDB season and episode) the scene numbering. Episodes
+// left out of numbers lose any earlier mapping.
+func (s *Store) SetScene(mediaID int64, aliases []string, numbers map[[2]int][2]int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE media SET aliases = ? WHERE id = ?`, strings.Join(aliases, "\n"), mediaID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE items SET scene_season = 0, scene_episode = 0 WHERE media_id = ?`, mediaID); err != nil {
+		return err
+	}
+	for tmdb, scene := range numbers {
+		if _, err := tx.Exec(`UPDATE items SET scene_season = ?, scene_episode = ? WHERE media_id = ? AND season = ? AND episode = ?`,
+			scene[0], scene[1], mediaID, tmdb[0], tmdb[1]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+const mediaCols = `id, kind, tmdb_id, title, year, poster, overview, aliases`
 
 func scanMedia(row interface{ Scan(...any) error }) (Media, error) {
 	var m Media
-	err := row.Scan(&m.ID, &m.Kind, &m.TMDBID, &m.Title, &m.Year, &m.Poster, &m.Overview)
+	var aliases string
+	err := row.Scan(&m.ID, &m.Kind, &m.TMDBID, &m.Title, &m.Year, &m.Poster, &m.Overview, &aliases)
+	if aliases != "" {
+		m.Aliases = strings.Split(aliases, "\n")
+	}
 	return m, err
 }
 
@@ -237,7 +278,7 @@ func (s *Store) RemoveMedia(id int64) error {
 	return err
 }
 
-const itemCols = `id, media_id, season, episode, title, air_date, state, path, download_id`
+const itemCols = `id, media_id, season, episode, title, air_date, state, path, download_id, scene_season, scene_episode`
 
 func (s *Store) queryItems(where string, args ...any) ([]Item, error) {
 	rows, err := s.db.Query(`SELECT `+itemCols+` FROM items WHERE `+where+` ORDER BY media_id, season, episode`, args...)
@@ -248,7 +289,7 @@ func (s *Store) queryItems(where string, args ...any) ([]Item, error) {
 	var out []Item
 	for rows.Next() {
 		var i Item
-		if err := rows.Scan(&i.ID, &i.MediaID, &i.Season, &i.Episode, &i.Title, &i.AirDate, &i.State, &i.Path, &i.Download); err != nil {
+		if err := rows.Scan(&i.ID, &i.MediaID, &i.Season, &i.Episode, &i.Title, &i.AirDate, &i.State, &i.Path, &i.Download, &i.SceneSeason, &i.SceneEpisode); err != nil {
 			return nil, err
 		}
 		out = append(out, i)
@@ -329,6 +370,18 @@ func (s *Store) SetImported(itemID int64, path string) error {
 // that were not imported go back to wanted.
 func (s *Store) FinishDownload(id int64) error {
 	return s.closeDownload(id, Done, false)
+}
+
+// CancelDownload stops a download without blocklisting the release.
+func (s *Store) CancelDownload(id int64) error {
+	return s.closeDownload(id, Failed, false)
+}
+
+// ClearItems forgets the files of a movie or show and stops wanting all of
+// it, after they were deleted from disk.
+func (s *Store) ClearItems(mediaID int64) error {
+	_, err := s.db.Exec(`UPDATE items SET state = ?, path = '', download_id = NULL WHERE media_id = ?`, Ignored, mediaID)
+	return err
 }
 
 // FailDownload blocklists the release and returns its items to wanted.

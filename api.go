@@ -76,6 +76,7 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("POST /api/media", s.addMedia)
 	api.HandleFunc("GET /api/media/{id}", s.media)
 	api.HandleFunc("DELETE /api/media/{id}", s.removeMedia)
+	api.HandleFunc("DELETE /api/media/{id}/files", s.deleteFiles)
 	api.HandleFunc("POST /api/media/{id}/seasons/{season}", s.wantSeason)
 	api.HandleFunc("POST /api/items/{id}", s.wantItem)
 	api.HandleFunc("GET /api/find", s.find)
@@ -330,12 +331,28 @@ func (s *server) addMedia(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int64{"id": id})
 }
 
+// removeMedia removes a movie or show from the library, and with ?files=1
+// deletes its files too.
 func (s *server) removeMedia(w http.ResponseWriter, r *http.Request) {
+	s.remove(w, r, r.FormValue("files") == "1", true)
+}
+
+// deleteFiles deletes the files of a movie or show but keeps it in the
+// library, no longer wanted.
+func (s *server) deleteFiles(w http.ResponseWriter, r *http.Request) {
+	s.remove(w, r, true, false)
+}
+
+func (s *server) remove(w http.ResponseWriter, r *http.Request, deleteFiles, fromLibrary bool) {
 	id, ok := pathID(w, r, "id")
 	if !ok {
 		return
 	}
-	if err := s.st.RemoveMedia(id); err != nil {
+	if _, err := s.st.Media(id); err != nil {
+		writeError(w, http.StatusNotFound, errors.New("not in the library"))
+		return
+	}
+	if err := s.run.Remove(r.Context(), id, deleteFiles, fromLibrary); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -520,12 +537,20 @@ func (s *server) grabRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// The release is named in scene numbering, so it covers the items in
+	// the scene season or episode the page searched for.
+	want, err := wantFor(s.st, m, req.Season, req.Episode)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	today := time.Now().Format("2006-01-02")
 	var ids []int64
 	for _, it := range items {
+		season, episode := it.Scene()
 		covered := !m.IsShow() ||
-			it.Season == req.Season && (it.Episode == req.Episode ||
-				req.Episode == 0 && it.AirDate != "" && it.AirDate <= today)
+			season == want.Season && (episode == want.Episode ||
+				want.Episode == 0 && it.AirDate != "" && it.AirDate <= today)
 		if covered && it.State != store.Downloading {
 			ids = append(ids, it.ID)
 		}

@@ -89,6 +89,7 @@ The image builds for amd64 and arm64:
     internal/config        TOML config
     internal/store         SQLite library and download state
     internal/tmdb          metadata lookups
+    internal/xem           scene numbering and names from TheXEM
     internal/torznab       indexer search
     internal/release       release name parsing and ranking
     internal/engine        embedded torrent client

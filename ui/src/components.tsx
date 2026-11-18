@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import type { Progress } from './api'
 import { bytes, rate, stateLabel } from './format'
 
-export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'md' | 'lg' }) {
+export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'sm' | 'md' | 'lg' }) {
   const [failed, setFailed] = useState(false)
   if (!src || failed) {
     return (
@@ -22,8 +22,13 @@ export function Poster({ src, title, size = 'md' }: { src: string; title: string
   )
 }
 
-export function StateBadge({ state }: { state: string }) {
-  return <span className={`badge badge-${state}`}>{stateLabel(state)}</span>
+export function StateBadge({ state, label }: { state: string; label?: string }) {
+  return (
+    <span className={`badge badge-${state}`}>
+      <span className="badge-dot" aria-hidden="true" />
+      {label ?? stateLabel(state)}
+    </span>
+  )
 }
 
 export function ProgressBar({ percent }: { percent: number }) {

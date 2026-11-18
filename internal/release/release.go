@@ -41,9 +41,11 @@ func Parse(name string) Info {
 }
 
 // Want describes what we are looking for. For a show, Episode 0 asks for a
-// season pack covering Count episodes.
+// season pack covering Count episodes. Season and Episode use the numbering
+// releases use, which can differ from TMDB's.
 type Want struct {
 	Title   string
+	Aliases []string // other titles releases may use
 	Year    int
 	Show    bool
 	Season  int
@@ -52,14 +54,33 @@ type Want struct {
 }
 
 // Query is the text sent to the indexers.
-func (w Want) Query() string {
+func (w Want) Query() string { return w.query(w.Title) }
+
+// Queries are the searches to run: one for the title and one per alias
+// that differs from it by more than punctuation.
+func (w Want) Queries() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, title := range append([]string{w.Title}, w.Aliases...) {
+		if q := w.query(title); !seen[normalize(q)] {
+			seen[normalize(q)] = true
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+func (w Want) query(title string) string {
+	// Release names leave out apostrophes ("Journeys" for "Journey's"), and
+	// indexers match words literally, so keeping them finds nothing.
+	title = strings.NewReplacer("'", "", "’", "").Replace(title)
 	switch {
 	case !w.Show:
-		return fmt.Sprintf("%s %d", w.Title, w.Year)
+		return fmt.Sprintf("%s %d", title, w.Year)
 	case w.Episode == 0:
-		return fmt.Sprintf("%s S%02d", w.Title, w.Season)
+		return fmt.Sprintf("%s S%02d", title, w.Season)
 	default:
-		return fmt.Sprintf("%s S%02dE%02d", w.Title, w.Season, w.Episode)
+		return fmt.Sprintf("%s S%02dE%02d", title, w.Season, w.Episode)
 	}
 }
 
@@ -156,17 +177,23 @@ func judge(q config.Quality, w Want, c Candidate, blocked func(string) bool) (re
 	return "", score
 }
 
-// sameTitle compares titles ignoring case and punctuation. Releases often
-// carry the year as part of the title ("Doctor Who 2005"), so both forms count.
+// sameTitle compares titles ignoring case and punctuation, accepting the
+// title or any alias. Releases often carry the year as part of the title
+// ("Doctor Who 2005"), so both forms count.
 func sameTitle(w Want, in Info) bool {
 	got := normalize(in.Title)
 	if got == "" {
 		return false
 	}
-	want := normalize(w.Title)
-	wantYear := normalize(fmt.Sprintf("%s %d", w.Title, w.Year))
 	gotYear := normalize(fmt.Sprintf("%s %d", in.Title, in.Year))
-	return got == want || got == wantYear || gotYear == wantYear
+	for _, title := range append([]string{w.Title}, w.Aliases...) {
+		want := normalize(title)
+		wantYear := normalize(fmt.Sprintf("%s %d", title, w.Year))
+		if got == want || got == wantYear || gotYear == wantYear {
+			return true
+		}
+	}
+	return false
 }
 
 func normalize(s string) string {

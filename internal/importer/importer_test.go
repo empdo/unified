@@ -63,3 +63,58 @@ func TestImportSingleEpisodeNamedByTorrent(t *testing.T) {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 }
+
+// Releases of a show with a scene mapping are named by the scene numbering.
+func TestImportSceneNumbering(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{DownloadDir: filepath.Join(root, "dl"), TVDir: filepath.Join(root, "tv")}
+	f := File{Path: "Frieren.Beyond.Journeys.End.S02E05.1080p.WEB.H264-GRP.mkv", Size: 5}
+	os.MkdirAll(cfg.DownloadDir, 0o755)
+	os.WriteFile(filepath.Join(cfg.DownloadDir, f.Path), []byte("x"), 0o644)
+
+	m := store.Media{Kind: "show", Title: "Frieren", Year: 2023}
+	items := []store.Item{{ID: 1, Season: 1, Episode: 33, SceneSeason: 2, SceneEpisode: 5}}
+	got, err := Import(cfg, m, items, f.Path, []File{f})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %+v, %v; want one import", got, err)
+	}
+	// The library keeps TMDB's numbering.
+	if want := filepath.Join(cfg.TVDir, "Frieren (2023)", "Season 01", "Frieren - S01E33.mkv"); got[0].Dest != want {
+		t.Errorf("dest = %q, want %q", got[0].Dest, want)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{DownloadDir: filepath.Join(root, "dl"), TVDir: filepath.Join(root, "tv"), MoviesDir: filepath.Join(root, "movies")}
+	write := func(p string) string {
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte("video"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	src := write(filepath.Join(cfg.DownloadDir, "Show.S01.Pack", "Show.S01E01.mkv"))
+	lib := filepath.Join(cfg.TVDir, "Show (2020)", "Season 01", "Show - S01E01.mkv")
+	if err := link(src, lib); err != nil {
+		t.Fatal(err)
+	}
+	other := write(filepath.Join(cfg.TVDir, "Other (2019)", "Season 01", "Other - S01E01.mkv"))
+	partial := write(filepath.Join(cfg.DownloadDir, "Show.S01E02", "Show.S01E02.mkv"))
+	outside := write(filepath.Join(root, "elsewhere.mkv"))
+
+	err := Delete(cfg, []string{lib, outside}, []string{partial})
+	if err == nil {
+		t.Error("deleting a file outside the library gave no error")
+	}
+	for _, p := range []string{lib, src, partial, filepath.Join(cfg.TVDir, "Show (2020)"), filepath.Join(cfg.DownloadDir, "Show.S01.Pack")} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s still exists", p)
+		}
+	}
+	for _, p := range []string{other, outside, cfg.TVDir, cfg.DownloadDir} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s was deleted: %v", p, err)
+		}
+	}
+}

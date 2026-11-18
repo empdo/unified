@@ -164,7 +164,11 @@ export const api = {
   media: (id: number) => request<MediaDetail>('GET', `api/media/${id}`),
   addMedia: (kind: Kind, tmdbId: number, wantAll: boolean) =>
     request<{ id: number }>('POST', 'api/media', { kind, tmdbId, wantAll }),
-  removeMedia: (id: number) => request<void>('DELETE', `api/media/${id}`),
+  /** Removes from the library; with deleteFiles its files are deleted too. */
+  removeMedia: (id: number, deleteFiles: boolean) =>
+    request<void>('DELETE', `api/media/${id}${deleteFiles ? '?files=1' : ''}`),
+  /** Deletes the files but keeps it in the library, no longer wanted. */
+  deleteFiles: (id: number) => request<void>('DELETE', `api/media/${id}/files`),
   wantSeason: (id: number, season: number, want: boolean) =>
     request<void>('POST', `api/media/${id}/seasons/${season}`, { want }),
   wantItem: (id: number, want: boolean) => request<void>('POST', `api/items/${id}`, { want }),

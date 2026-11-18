@@ -80,9 +80,10 @@ type runner struct {
 	// Print a progress line per download every tick (terminal mode).
 	printProgress bool
 
-	wake  chan struct{}
-	fails chan int64
-	grabs chan grabRequest
+	wake    chan struct{}
+	fails   chan int64
+	grabs   chan grabRequest
+	removes chan removeRequest
 
 	mu       sync.Mutex
 	snapshot []Progress
@@ -115,6 +116,7 @@ func newRunner(ctx context.Context, cfg func() *config.Config, st *store.Store) 
 		wake:      make(chan struct{}, 1),
 		fails:     make(chan int64, 16),
 		grabs:     make(chan grabRequest),
+		removes:   make(chan removeRequest),
 	}
 	if vpn, _ := eng.VPN(); vpn != "" {
 		r.vpn = vpn
@@ -180,6 +182,92 @@ func (r *runner) Grab(ctx context.Context, items []int64, title, link string) er
 	}
 }
 
+type removeRequest struct {
+	media                    int64
+	deleteFiles, fromLibrary bool
+	reply                    chan error
+}
+
+// Remove stops the downloads of a movie or show. With deleteFiles it also
+// deletes its files, from the library and the download directory, and stops
+// wanting it; with fromLibrary it is removed from the library.
+func (r *runner) Remove(ctx context.Context, media int64, deleteFiles, fromLibrary bool) error {
+	req := removeRequest{media, deleteFiles, fromLibrary, make(chan error, 1)}
+	select {
+	case r.removes <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+	select {
+	case err := <-req.reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *runner) remove(req removeRequest) error {
+	var downloaded []string
+	stop := func(a *activeDownload) {
+		if req.deleteFiles && engine.HasInfo(a.t) {
+			for _, f := range a.t.Files() {
+				downloaded = append(downloaded, filepath.Join(r.cfg().DownloadDir, f.Path()))
+			}
+		}
+		a.t.Drop()
+	}
+	for id, a := range r.active {
+		if a.mediaID == req.media {
+			stop(a)
+			delete(r.active, id)
+			if err := r.st.CancelDownload(id); err != nil {
+				return err
+			}
+		}
+	}
+	for id, a := range r.seeding {
+		if a.mediaID == req.media {
+			stop(a)
+			delete(r.seeding, id)
+		}
+	}
+	defer r.publish()
+
+	m, err := r.st.Media(req.media)
+	if err != nil {
+		return err
+	}
+	if req.deleteFiles {
+		items, err := r.st.Items(m.ID)
+		if err != nil {
+			return err
+		}
+		var library []string
+		for _, it := range items {
+			if it.Path != "" {
+				library = append(library, it.Path)
+			}
+		}
+		// Whatever could not be deleted, nothing should be downloaded again.
+		deleteErr := importer.Delete(r.cfg(), library, downloaded)
+		if err := r.st.ClearItems(m.ID); err != nil {
+			return err
+		}
+		if deleteErr != nil {
+			r.logf("deleting the files of %s: %v", m.Title, deleteErr)
+			return deleteErr
+		}
+		r.logf("deleted the files of %s", m.Title)
+	}
+	if req.fromLibrary {
+		r.logf("removed %s from the library", m.Title)
+		return r.st.RemoveMedia(m.ID)
+	}
+	return nil
+}
+
 func (r *runner) Snapshot() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -237,6 +325,7 @@ func (r *runner) loop(keepRunning bool) error {
 	if err := r.resume(); err != nil {
 		return err
 	}
+	r.refreshScenes()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	retry := time.NewTicker(retryInterval)
@@ -288,6 +377,9 @@ func (r *runner) loop(keepRunning bool) error {
 				r.logf("grabbed [%d] %s (chosen by hand)", dl.ID, dl.Name)
 			}
 			g.reply <- err
+			continue
+		case req := <-r.removes:
+			req.reply <- r.remove(req)
 			continue
 		case <-tick.C:
 		}
@@ -405,8 +497,29 @@ func (r *runner) track(dl store.Download, t *torrent.Torrent) {
 	r.publish()
 }
 
-// grabWanted searches for every wanted item. A season that is wanted in full
-// is tried as a season pack first, then episode by episode.
+// refreshScenes updates the scene numbering of every show, which changes as
+// new seasons air and TheXEM's mappings are filled in.
+func (r *runner) refreshScenes() {
+	if r.cfg().TMDBKey == "" {
+		return
+	}
+	media, err := r.st.AllMedia()
+	if err != nil {
+		r.logf("could not list the library: %v", err)
+		return
+	}
+	for _, m := range media {
+		if !m.IsShow() || r.ctx.Err() != nil {
+			continue
+		}
+		if err := refreshScene(r.cfg(), r.st, m); err != nil {
+			r.logf("could not look up scene numbering for %s: %v", m.Title, err)
+		}
+	}
+}
+
+// grabWanted searches for every wanted item. A scene season that is wanted
+// in full is tried as a season pack first, then episode by episode.
 func (r *runner) grabWanted() error {
 	wanted, err := r.st.WantedItems()
 	if err != nil {
@@ -426,7 +539,8 @@ func (r *runner) grabWanted() error {
 		if r.exhausted[it.ID] {
 			continue
 		}
-		k := seasonKey{it.MediaID, it.Season}
+		season, _ := it.Scene()
+		k := seasonKey{it.MediaID, season}
 		if _, ok := groups[k]; !ok {
 			order = append(order, k)
 		}
@@ -440,22 +554,22 @@ func (r *runner) grabWanted() error {
 			return err
 		}
 		if !m.IsShow() {
-			w, _ := wantFor(r.st, m, 0, 0)
-			if !r.grab(items, w) {
+			if !r.grab(items, sceneWant(m, nil, 0, 0)) {
 				r.exhausted[items[0].ID] = true
 			}
 			continue
 		}
-		pack, err := wantFor(r.st, m, k.season, 0)
+		all, err := r.st.Items(m.ID)
 		if err != nil {
 			return err
 		}
+		pack := sceneWant(m, all, k.season, 0)
 		if len(items) > 1 && len(items) == pack.Count && r.grab(items, pack) {
 			continue
 		}
 		for _, it := range items {
-			w, _ := wantFor(r.st, m, it.Season, it.Episode)
-			if !r.grab([]store.Item{it}, w) {
+			season, episode := it.Scene()
+			if !r.grab([]store.Item{it}, sceneWant(m, all, season, episode)) {
 				r.exhausted[it.ID] = true
 			}
 		}

@@ -21,3 +21,20 @@ const stateLabels: Record<string, string> = {
 }
 
 export const stateLabel = (state: string) => stateLabels[state] ?? state
+
+/** A TMDB air date (2025-01-31) as "31 Jan 2025"; empty when unknown. */
+export function airDate(date: string): string {
+  const d = new Date(date + 'T00:00:00')
+  if (!date || isNaN(d.getTime())) return ''
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+/** Roughly how long a download has left at its current rate: "17 min left". */
+export function timeLeft(done: number, total: number, rate: number): string {
+  if (rate <= 0 || total <= done) return ''
+  const minutes = Math.ceil((total - done) / rate / 60)
+  if (minutes < 60) return `${minutes} min left`
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  return m ? `${h} h ${m} min left` : `${h} h left`
+}

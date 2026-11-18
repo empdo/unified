@@ -1,24 +1,20 @@
 import { useState } from 'react'
 import { api, type Item, type MediaDetail } from '../api'
 import { Notice, Poster, ProgressBar, Spinner, StateBadge, progressText } from '../components'
-import { episodeCode, plural } from '../format'
+import { plural } from '../format'
 import { useAction, useData } from '../hooks'
 import { href, navigate } from '../router'
+import { ShowSeasons } from '../seasons'
 import { useActiveByMedia } from '../status'
 
 export default function MediaPage({ id }: { id: number }) {
   const media = useData(() => api.media(id), [id], 5000)
-  const action = useAction()
+  const [removing, setRemoving] = useState(false)
   const downloads = useActiveByMedia().get(id) ?? []
 
   if (media.error && !media.data) return <Notice kind="error">{media.error}</Notice>
   if (!media.data) return <Spinner label="Loading…" />
   const m = media.data
-
-  const remove = async () => {
-    if (!confirm(`Remove ${m.title} from the library? Downloaded files are kept.`)) return
-    if (await action.run(() => api.removeMedia(m.id))) navigate('/')
-  }
 
   return (
     <>
@@ -50,17 +46,81 @@ export default function MediaPage({ id }: { id: number }) {
                 Browse releases
               </a>
             )}
-            <button className="button danger" onClick={remove} disabled={action.busy}>
-              Remove
+            <button className="button danger" onClick={() => setRemoving(!removing)} aria-expanded={removing}>
+              Remove…
             </button>
           </div>
-          {action.error && <Notice kind="error">{action.error}</Notice>}
+          {removing && <RemovePanel media={m} downloading={downloads.length} close={() => setRemoving(false)} reload={media.reload} />}
         </div>
       </section>
-      {m.seasons.map((s) => (
-        <Season key={s.number} media={m} number={s.number} episodes={s.episodes} reload={media.reload} />
-      ))}
+      {m.kind === 'show' && (
+        <section className="media-seasons">
+          <ShowSeasons media={m} reload={media.reload} />
+        </section>
+      )}
     </>
+  )
+}
+
+/** The ways to remove a movie or show: its files, it from the library, or both. */
+function RemovePanel(props: { media: MediaDetail; downloading: number; close: () => void; reload: () => void }) {
+  const { media: m, downloading, close, reload } = props
+  const action = useAction()
+  const items = m.movie ? [m.movie] : m.seasons.flatMap((s) => s.episodes)
+  const files = items.filter((it) => it.state === 'imported').length
+  const what = m.kind === 'movie' ? 'the movie' : 'the show'
+
+  const onDisk = [
+    files > 0 && (m.movie ? 'its file' : plural(files, 'episode file')),
+    downloading > 0 && plural(downloading, 'running download'),
+  ]
+    .filter(Boolean)
+    .join(' and ')
+
+  const deleteFiles = async () => {
+    if (await action.run(() => api.deleteFiles(m.id))) {
+      close()
+      reload()
+    }
+  }
+  const remove = async (withFiles: boolean) => {
+    if (await action.run(() => api.removeMedia(m.id, withFiles))) navigate('/')
+  }
+
+  return (
+    <div className="remove-panel" role="region" aria-label={`Remove ${m.title}`}>
+      <h3>Remove {m.title}</h3>
+      <p className="small muted">
+        {onDisk ? `On disk: ${onDisk}.` : 'Nothing of it is on disk yet.'} Deleting files also removes the copies
+        in the download folder, so seeding stops.
+      </p>
+      <ul className="remove-options">
+        <li className="remove-option">
+          <button className="button danger" disabled={action.busy} onClick={deleteFiles}>
+            Delete files
+          </button>
+          <p>Keep {what} in the library, with nothing wanted, so it isn't downloaded again.</p>
+        </li>
+        <li className="remove-option">
+          <button className="button danger" disabled={action.busy} onClick={() => remove(true)}>
+            Delete files and remove
+          </button>
+          <p>Delete everything on disk and remove {what} from unified.</p>
+        </li>
+        <li className="remove-option">
+          <button className="button" disabled={action.busy} onClick={() => remove(false)}>
+            Remove, keep files
+          </button>
+          <p>Remove {what} from unified and leave its files where they are.</p>
+        </li>
+      </ul>
+      {action.error && <Notice kind="error">{action.error}</Notice>}
+      <div>
+        <button className="button small" onClick={close} disabled={action.busy}>
+          Cancel
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -85,84 +145,5 @@ function MovieWantButton({ media, item }: { media: { reload: () => void }; item:
     >
       {want ? 'Download' : 'Stop wanting'}
     </button>
-  )
-}
-
-function Season(props: { media: MediaDetail; number: number; episodes: Item[]; reload: () => void }) {
-  const { media, number, episodes, reload } = props
-  const action = useAction()
-  const [open, setOpen] = useState(() => episodes.some((e) => e.state !== 'ignored'))
-  const count = (state: string) => episodes.filter((e) => e.state === state).length
-  const imported = count('imported')
-  const wanted = count('wanted')
-  const ignored = count('ignored')
-
-  const setSeason = (want: boolean) => action.run(() => api.wantSeason(media.id, number, want)).then(reload)
-  const setEpisode = (e: Item, want: boolean) => action.run(() => api.wantItem(e.id, want)).then(reload)
-
-  return (
-    <section className="season">
-      <div className="season-head">
-        <button className="season-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
-          <span className={`chevron ${open ? 'open' : ''}`} aria-hidden="true">
-            ›
-          </span>
-          <h2>Season {number}</h2>
-          <span className="muted small">
-            {imported} of {plural(episodes.length, 'episode')} in library
-            {wanted > 0 && ` · ${wanted} wanted`}
-          </span>
-        </button>
-        <div className="actions">
-          <a className="button small" href={href(`/releases?media=${media.id}&season=${number}`)}>
-            Season releases
-          </a>
-          {wanted > 0 && (
-            <button className="button small" disabled={action.busy} onClick={() => setSeason(false)}>
-              Stop wanting
-            </button>
-          )}
-          {ignored > 0 && (
-            <button className="button small primary" disabled={action.busy} onClick={() => setSeason(true)}>
-              Download season
-            </button>
-          )}
-        </div>
-      </div>
-      {action.error && <Notice kind="error">{action.error}</Notice>}
-      {open && (
-        <table className="episodes">
-          <tbody>
-            {episodes.map((e) => (
-              <tr key={e.id}>
-                <td className="ep">{episodeCode(e.season, e.episode)}</td>
-                <td className="ep-title">{e.title || <span className="muted">TBA</span>}</td>
-                <td className="muted small nowrap hide-narrow">{e.airDate}</td>
-                <td>
-                  <StateBadge state={e.state} />
-                </td>
-                <td className="right nowrap">
-                  {(e.state === 'ignored' || e.state === 'wanted') && (
-                    <button
-                      className="link"
-                      disabled={action.busy}
-                      onClick={() => setEpisode(e, e.state === 'ignored')}
-                    >
-                      {e.state === 'ignored' ? 'Want' : 'Unwant'}
-                    </button>
-                  )}
-                  <a
-                    className="link"
-                    href={href(`/releases?media=${media.id}&season=${e.season}&episode=${e.episode}`)}
-                  >
-                    Releases
-                  </a>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </section>
   )
 }

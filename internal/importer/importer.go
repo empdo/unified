@@ -3,6 +3,7 @@
 package importer
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -75,7 +76,8 @@ func matches(m store.Media, it store.Item, v File, torrentName string, videoCoun
 	if info.Season == 0 && info.Episode == 0 && videoCount == 1 {
 		info = release.Parse(torrentName)
 	}
-	return info.Season == it.Season && info.Episode == it.Episode
+	season, episode := it.Scene()
+	return info.Season == season && info.Episode == episode
 }
 
 func destination(cfg *config.Config, m store.Media, it store.Item, ext string) string {
@@ -134,4 +136,70 @@ func link(src, dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// Delete removes library files and the download directory copies they were
+// linked from, so the space is freed, along with downloads (files of torrents
+// still in the client) given separately. Directories left empty are removed.
+// Paths outside the library and download directories are left alone.
+func Delete(cfg *config.Config, library, downloads []string) error {
+	roots := []string{cfg.DownloadDir, cfg.MoviesDir, cfg.TVDir}
+	var linked []os.FileInfo
+	for _, p := range library {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			linked = append(linked, fi)
+		}
+	}
+	remove := append(append([]string(nil), library...), downloads...)
+	if len(linked) > 0 {
+		filepath.WalkDir(cfg.DownloadDir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() {
+				return nil
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			for _, l := range linked {
+				if fi.Size() == l.Size() && os.SameFile(fi, l) {
+					remove = append(remove, p)
+					break
+				}
+			}
+			return nil
+		})
+	}
+
+	var errs []error
+	for _, p := range remove {
+		root := within(p, roots)
+		if root == "" {
+			errs = append(errs, fmt.Errorf("not deleting %s: outside the library and download directories", p))
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+			continue
+		}
+		for dir := filepath.Dir(p); dir != root && within(dir, roots) == root; dir = filepath.Dir(dir) {
+			if os.Remove(dir) != nil {
+				break // not empty
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// within returns the root that contains path, or "" if none does.
+func within(path string, roots []string) string {
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		rel, err := filepath.Rel(root, path)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return root
+		}
+	}
+	return ""
 }

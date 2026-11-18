@@ -42,27 +42,30 @@ export default function App() {
   const active = status.data?.status.active.length ?? 0
   return (
     <StatusContext.Provider value={status.data}>
-      <header className="topbar">
-        <a className="brand" href={href('/')}>
-          unified
-        </a>
-        <nav>
+      <header className="masthead">
+        <div className="masthead-top">
+          <a className="brand" href={href('/')}>
+            unified
+          </a>
+          <span className="dateline">{today()} · TV &amp; film</span>
+          <SearchBox
+            key={route.params.get('q') ?? ''}
+            kind={section === 'add' && route.params.get('kind') === 'show' ? 'show' : 'movie'}
+            query={section === 'add' ? (route.params.get('q') ?? '') : ''}
+          />
+        </div>
+        <nav className="tabs">
           <a className={section === undefined || section === 'media' ? 'current' : ''} href={href('/')}>
             Library
           </a>
           <a className={section === 'downloads' ? 'current' : ''} href={href('/downloads')}>
-            Downloads{active > 0 && <span className="count">{active}</span>}
+            Downloads{active > 0 && ` (${active})`}
           </a>
           <a className={section === 'settings' ? 'current' : ''} href={href('/settings')}>
             Settings
           </a>
+          <VpnStatus />
         </nav>
-        <SearchBox
-          key={route.params.get('q') ?? ''}
-          kind={section === 'add' && route.params.get('kind') === 'show' ? 'show' : 'movie'}
-          query={section === 'add' ? (route.params.get('q') ?? '') : ''}
-        />
-        <VpnDot />
       </header>
       {status.error && <div className="offline">Can't reach unified: {status.error}</div>}
       <main>{page}</main>
@@ -89,25 +92,30 @@ function SearchBox(props: { kind: Kind; query: string }) {
       <input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        placeholder={kind === 'movie' ? 'Add a movie…' : 'Add a show…'}
+        placeholder={kind === 'movie' ? 'Find a movie to add…' : 'Find a show to add…'}
         aria-label="Title to add"
       />
+      <button className="button primary" type="submit">
+        Search
+      </button>
     </form>
   )
 }
 
-function VpnDot() {
+const today = () => new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })
+
+function VpnStatus() {
   const s = useStatus()?.status
   if (!s) return null
-  const [state, text] = s.vpnError
-    ? ['down', `VPN down: ${s.vpnError}`]
+  const [state, label, text] = s.vpnError
+    ? ['down', 'VPN down', `VPN down: ${s.vpnError}`]
     : s.vpn
-      ? ['up', `Torrent traffic uses ${s.vpn}`]
-      : ['off', 'Torrent traffic is not bound to a VPN']
+      ? ['up', 'VPN connected', `Torrent traffic uses ${s.vpn}`]
+      : ['off', 'No VPN', 'Torrent traffic is not bound to a VPN']
   return (
-    <a className={`vpn vpn-${state}`} href={href('/downloads')} title={text} aria-label={text}>
+    <a className={`vpn vpn-${state}`} href={href('/downloads')} title={text}>
       <span className="dot" />
-      <span className="vpn-label">VPN</span>
+      {label}
     </a>
   )
 }

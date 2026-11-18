@@ -127,6 +127,15 @@ func (c *Client) Details(kind string, id int) (Result, error) {
 	return r.toResult(), nil
 }
 
+// TVDBID returns the TheTVDB id of a show, or 0 when TMDB does not know it.
+func (c *Client) TVDBID(showID int) (int, error) {
+	var ids struct {
+		TVDB int `json:"tvdb_id"`
+	}
+	err := c.get("/tv/"+strconv.Itoa(showID)+"/external_ids", nil, &ids)
+	return ids.TVDB, err
+}
+
 // Episodes returns every episode of a show, skipping specials (season 0).
 func (c *Client) Episodes(showID int) ([]Episode, error) {
 	var show struct {

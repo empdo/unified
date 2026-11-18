@@ -19,6 +19,7 @@ import (
 	"unified/internal/store"
 	"unified/internal/tmdb"
 	"unified/internal/torznab"
+	"unified/internal/xem"
 )
 
 const usage = `usage: unified <command>
@@ -225,7 +226,82 @@ func addToLibrary(cfg *config.Config, st *store.Store, kind string, pick tmdb.Re
 			return id, 0, 0, err
 		}
 	}
+	if m, err := st.Media(id); err == nil {
+		// Without it the show is searched by TMDB's numbering, which is
+		// right for most shows, so a failed lookup is not fatal.
+		if err := refreshScene(cfg, st, m); err != nil {
+			fmt.Fprintf(os.Stderr, "could not look up scene numbering for %s: %v\n", m.Title, err)
+		}
+	}
 	return id, len(episodes), wanted, nil
+}
+
+// refreshScene looks up on TheXEM how releases name a show and number its
+// episodes, and stores it. Most shows have no entry there and keep TMDB's
+// numbering.
+func refreshScene(cfg *config.Config, st *store.Store, m store.Media) error {
+	tvdb, err := tmdb.New(cfg.TMDBKey).TVDBID(m.TMDBID)
+	if err != nil || tvdb == 0 {
+		return err
+	}
+	x := xem.New()
+	maps, err := x.Map(tvdb)
+	if err != nil {
+		return err
+	}
+	names, err := x.Names(tvdb)
+	if err != nil {
+		return err
+	}
+	items, err := st.Items(m.ID)
+	if err != nil {
+		return err
+	}
+	return st.SetScene(m.ID, names, sceneNumbers(items, maps))
+}
+
+// sceneNumbers maps a show's TMDB episodes, by season and episode, to the
+// numbering releases use, leaving out those that are numbered the same.
+// TheXEM is keyed by TVDB numbering. When TMDB numbers the show the same way
+// that is used directly; otherwise (TMDB often keeps episodes in one season
+// that TVDB splits) episodes are paired up by their order in the show.
+func sceneNumbers(items []store.Item, maps []xem.Mapping) map[[2]int][2]int {
+	tmdbHas := map[[2]int]bool{}
+	for _, it := range items {
+		tmdbHas[[2]int{it.Season, it.Episode}] = true
+	}
+	byTVDB := map[[2]int]xem.Episode{}
+	byAbsolute := map[int]xem.Episode{}
+	sameNumbering := true
+	for _, mp := range maps {
+		k := [2]int{mp.TVDB.Season, mp.TVDB.Episode}
+		if k[0] == 0 {
+			continue // specials
+		}
+		byTVDB[k] = mp.Scene
+		if mp.TVDB.Absolute > 0 {
+			byAbsolute[mp.TVDB.Absolute] = mp.Scene
+		}
+		sameNumbering = sameNumbering && tmdbHas[k]
+	}
+
+	out := map[[2]int][2]int{}
+	absolute := 0
+	for _, it := range items { // ordered by season and episode
+		if it.Season == 0 {
+			continue
+		}
+		absolute++
+		k := [2]int{it.Season, it.Episode}
+		scene, ok := byTVDB[k]
+		if !sameNumbering {
+			scene, ok = byAbsolute[absolute]
+		}
+		if ok && scene.Episode > 0 && (scene.Season != it.Season || scene.Episode != it.Episode) {
+			out[k] = [2]int{scene.Season, scene.Episode}
+		}
+	}
+	return out
 }
 
 func cmdList(st *store.Store, args []string) error {
@@ -236,7 +312,11 @@ func cmdList(st *store.Store, args []string) error {
 		}
 		items, err := st.Items(id)
 		for _, it := range items {
-			fmt.Printf("S%02dE%02d  %-11s %-10s %s\n", it.Season, it.Episode, it.State, it.AirDate, it.Title)
+			scene := ""
+			if s, e := it.Scene(); s != it.Season || e != it.Episode {
+				scene = fmt.Sprintf(" (scene S%02dE%02d)", s, e)
+			}
+			fmt.Printf("S%02dE%02d  %-11s %-10s %s%s\n", it.Season, it.Episode, it.State, it.AirDate, it.Title, scene)
 		}
 		return err
 	}
@@ -277,26 +357,45 @@ func summary(st *store.Store, m store.Media) (string, error) {
 }
 
 // wantFor describes what to search for: a movie, one episode, or with
-// episode 0 a whole season.
+// episode 0 a whole season. Season and episode are TMDB's numbers. Searches
+// use the scene numbering, so for a season that is the scene season the
+// TMDB season starts in.
 func wantFor(st *store.Store, m store.Media, season, episode int) (release.Want, error) {
-	w := release.Want{Title: m.Title, Year: m.Year, Show: m.IsShow(), Count: 1}
 	if !m.IsShow() {
-		return w, nil
+		return sceneWant(m, nil, 0, 0), nil
 	}
-	w.Season, w.Episode = season, episode
-	if episode == 0 {
-		items, err := st.Items(m.ID)
-		if err != nil {
-			return w, err
+	items, err := st.Items(m.ID)
+	if err != nil {
+		return release.Want{}, err
+	}
+	sceneSeason, sceneEpisode := season, episode
+	for _, it := range items {
+		if it.Season == season && (episode == 0 || it.Episode == episode) {
+			sceneSeason, sceneEpisode = it.Scene()
+			break
 		}
+	}
+	if episode == 0 {
+		sceneEpisode = 0
+	}
+	return sceneWant(m, items, sceneSeason, sceneEpisode), nil
+}
+
+// sceneWant is wantFor in scene numbering, given all of the show's items.
+func sceneWant(m store.Media, items []store.Item, season, episode int) release.Want {
+	w := release.Want{
+		Title: m.Title, Aliases: m.Aliases, Year: m.Year, Show: m.IsShow(),
+		Season: season, Episode: episode, Count: 1,
+	}
+	if m.IsShow() && episode == 0 {
 		w.Count = 0
 		for _, it := range items {
-			if it.Season == season {
+			if s, _ := it.Scene(); s == season {
 				w.Count++
 			}
 		}
 	}
-	return w, nil
+	return w
 }
 
 // searchAll queries every configured indexer, reporting failures through
@@ -307,13 +406,15 @@ func searchAll(ctx context.Context, cfg *config.Config, w release.Want, logf fun
 		category = torznab.TV
 	}
 	var all []torznab.Release
-	for _, ix := range cfg.Indexers {
-		rels, err := torznab.Search(ctx, ix, w.Query(), category)
-		if err != nil {
-			logf("  indexer error: %v", err)
-			continue
+	for _, q := range w.Queries() {
+		for _, ix := range cfg.Indexers {
+			rels, err := torznab.Search(ctx, ix, q, category)
+			if err != nil {
+				logf("  indexer error: %v", err)
+				continue
+			}
+			all = append(all, rels...)
 		}
-		all = append(all, rels...)
 	}
 	return all
 }

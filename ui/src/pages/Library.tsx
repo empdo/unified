@@ -1,19 +1,19 @@
-import { useState } from 'react'
 import { api, type MediaSummary, type Progress } from '../api'
-import { Notice, Poster, ProgressBar, Spinner } from '../components'
-import { useData } from '../hooks'
+import { Notice, Poster, ProgressBar, Spinner, StateBadge } from '../components'
+import { plural, rate, timeLeft } from '../format'
+import { useAction, useData } from '../hooks'
 import { href } from '../router'
 import { useActiveByMedia, useStatus } from '../status'
-
-type Filter = 'all' | 'movie' | 'show'
 
 export default function Library() {
   const library = useData(api.library, [], 10000)
   const status = useStatus()
   const active = useActiveByMedia()
-  const [filter, setFilter] = useState<Filter>('all')
 
-  const items = (library.data ?? []).filter((m) => filter === 'all' || m.kind === filter)
+  const all = library.data ?? []
+  const shows = all.filter((m) => m.kind === 'show')
+  const movies = all.filter((m) => m.kind === 'movie')
+
   return (
     <>
       {status && !status.tmdb && (
@@ -26,69 +26,169 @@ export default function Library() {
           Add an indexer in <a href={href('/settings')}>Settings</a>, or nothing can be downloaded.
         </Notice>
       )}
-      <div className="page-head">
-        <h1>Library</h1>
-        <div className="segmented" role="radiogroup" aria-label="Show">
-          {(['all', 'movie', 'show'] as const).map((f) => (
-            <button key={f} role="radio" aria-checked={filter === f} onClick={() => setFilter(f)}>
-              {{ all: 'All', movie: 'Movies', show: 'Shows' }[f]}
-            </button>
-          ))}
-        </div>
-      </div>
+      <Tonight titles={new Map(all.map((m) => [m.id, m.title]))} />
       {library.error && <Notice kind="error">{library.error}</Notice>}
       {library.loading && !library.data && <Spinner label="Loading library…" />}
-      {library.data && items.length === 0 && (
+      {library.data?.length === 0 && (
         <div className="empty">
-          <h2>{library.data.length === 0 ? 'Your library is empty' : 'Nothing here'}</h2>
-          <p className="muted">Search for a movie or show in the bar at the top to add it.</p>
+          <h2>Your library is empty</h2>
+          <p className="muted">Search for a movie or show at the top of the page to add it.</p>
         </div>
       )}
-      <div className="poster-grid">
-        {items.map((m) => (
-          <Card key={m.id} media={m} downloads={active.get(m.id) ?? []} />
-        ))}
-      </div>
+      {all.length > 0 && (
+        <div className="listings">
+          <section className="listings-shows">
+            <div className="section-head">
+              <h2>Shows</h2>
+              <span className="muted small">{plural(shows.length, 'show')}</span>
+            </div>
+            {shows.length === 0 && <p className="muted">No shows yet. Switch the search to Show to add one.</p>}
+            <div className="show-grid">
+              {shows.map((m) => (
+                <ShowCard key={m.id} media={m} downloads={active.get(m.id) ?? []} />
+              ))}
+            </div>
+          </section>
+
+          <section className="listings-movies">
+            <div className="section-head">
+              <h2>Movies</h2>
+              <span className="muted small">{plural(movies.length, 'movie')}</span>
+            </div>
+            {movies.length === 0 && <p className="muted">No movies yet.</p>}
+            {movies.map((m) => (
+              <MovieCard key={m.id} media={m} downloads={active.get(m.id) ?? []} reload={library.reload} />
+            ))}
+          </section>
+        </div>
+      )}
     </>
   )
 }
 
-function Card({ media, downloads }: { media: MediaSummary; downloads: Progress[] }) {
+/** The strip of running downloads at the top of the library. */
+function Tonight({ titles }: { titles: Map<number, string> }) {
+  const status = useStatus()
+  const action = useAction()
+  if (!status) return null
+  const active = status.status.active
+  const shown = active.slice(0, 3)
+
+  return (
+    <section className="tonight" aria-label="Downloading now">
+      <div className="tonight-label">
+        <span className="tonight-title">Tonight</span>
+        <span className="small">
+          {active.length === 0 ? 'Nothing downloading' : `${plural(active.length, 'download')} running`}
+        </span>
+      </div>
+      <div className="tonight-items">
+        {shown.map((p) => (
+          <a key={p.id} className="tonight-item" href={href(`/media/${p.mediaId}`)}>
+            <span className="tonight-name">
+              <span>{titles.get(p.mediaId) ?? p.name}</span>
+              {p.hasInfo && <strong>{Math.floor(p.percent)}%</strong>}
+            </span>
+            <ProgressBar percent={p.hasInfo ? p.percent : 0} />
+            <span className="tonight-meta">{tonightMeta(p)}</span>
+          </a>
+        ))}
+        {active.length > shown.length && (
+          <a className="tonight-more" href={href('/downloads')}>
+            +{active.length - shown.length} more
+          </a>
+        )}
+      </div>
+      <div className="tonight-side">
+        <button className="button" disabled={action.busy} onClick={() => action.run(api.searchNow)}>
+          {action.busy ? 'Searching…' : 'Search for wanted now'}
+        </button>
+        <span className="small">{action.error ?? 'Also runs by itself every 30 minutes'}</span>
+      </div>
+    </section>
+  )
+}
+
+function tonightMeta(p: Progress): string {
+  if (!p.hasInfo) return `Starting · ${plural(p.peers, 'peer')}`
+  return [rate(p.rate), plural(p.peers, 'peer'), timeLeft(p.done, p.total, p.rate)].filter(Boolean).join(' · ')
+}
+
+/** A show in the library; its episodes are managed on the show page. */
+function ShowCard({ media, downloads }: { media: MediaSummary; downloads: Progress[] }) {
   const c = media.counts
   const total = (c.ignored ?? 0) + (c.wanted ?? 0) + (c.downloading ?? 0) + (c.imported ?? 0)
-  let label: string
-  let tone: string
-  if (downloads.length > 0) {
-    const p = downloads[0]
-    label = p.hasInfo ? `Downloading ${Math.floor(p.percent)}%` : 'Starting download…'
-    tone = 'downloading'
-  } else if (media.kind === 'movie') {
-    tone = c.imported ? 'imported' : c.wanted ? 'wanted' : c.downloading ? 'downloading' : 'ignored'
-    label = { imported: 'In library', wanted: 'Wanted', downloading: 'Downloading', ignored: 'Not wanted' }[tone]!
-  } else if (total > 0 && c.imported === total) {
-    tone = 'imported'
-    label = 'Complete'
-  } else {
-    tone = c.wanted ? 'wanted' : c.imported ? 'imported' : 'ignored'
-    label = c.wanted ? `${c.wanted} wanted · ${c.imported ?? 0}/${total}` : `${c.imported ?? 0} of ${total} episodes`
-  }
+  const imported = c.imported ?? 0
+  const summary =
+    total > 0 && imported === total
+      ? `All ${plural(total, 'episode')} in library`
+      : [`${imported} of ${plural(total, 'episode')} in library`, c.wanted && `${c.wanted} wanted`]
+          .filter(Boolean)
+          .join(' · ')
+  const p = downloads[0]
+
   return (
-    <a className="card" href={href(`/media/${media.id}`)}>
-      <div className="card-art">
-        <Poster src={media.poster} title={media.title} />
-        {downloads.length > 0 && downloads[0].hasInfo && <ProgressBar percent={downloads[0].percent} />}
-      </div>
-      <div className="card-title" title={media.title}>
-        {media.title}
-      </div>
-      <div className="card-meta">
-        {media.year > 0 && `${media.year} · `}
-        {media.kind === 'movie' ? 'Movie' : 'Show'}
-      </div>
-      <div className="card-status">
-        <span className={`dot-${tone}`} />
-        <span>{label}</span>
-      </div>
+    <a className="movie show-card" href={href(`/media/${media.id}`)}>
+      <Poster src={media.poster} title={media.title} size="sm" />
+      <span className="movie-body">
+        <span className="movie-title">
+          {media.title} {media.year > 0 && <span className="muted">({media.year})</span>}
+        </span>
+        <span className="muted small">{summary}</span>
+        {downloads.length > 0 || c.downloading ? (
+          <StateBadge
+            state="downloading"
+            label={p?.hasInfo ? `Downloading ${Math.floor(p.percent)}%` : `${c.downloading ?? 1} downloading`}
+          />
+        ) : null}
+      </span>
     </a>
+  )
+}
+
+function MovieCard({ media, downloads, reload }: { media: MediaSummary; downloads: Progress[]; reload: () => void }) {
+  const action = useAction()
+  const c = media.counts
+  const state = downloads.length > 0 || c.downloading ? 'downloading' : c.imported ? 'imported' : c.wanted ? 'wanted' : 'ignored'
+  const p = downloads[0]
+  const label = state === 'downloading' && p?.hasInfo ? `Downloading ${Math.floor(p.percent)}%` : undefined
+
+  // The library lists counts only, so look up the movie's item before changing it.
+  const want = (want: boolean) =>
+    action
+      .run(async () => {
+        const d = await api.media(media.id)
+        if (d.movie) await api.wantItem(d.movie.id, want)
+      })
+      .then(reload)
+
+  return (
+    <article className="movie">
+      <a href={href(`/media/${media.id}`)} tabIndex={-1} aria-hidden="true">
+        <Poster src={media.poster} title={media.title} size="sm" />
+      </a>
+      <div className="movie-body">
+        <a className="movie-title" href={href(`/media/${media.id}`)}>
+          {media.title} {media.year > 0 && <span className="muted">({media.year})</span>}
+        </a>
+        <StateBadge state={state} label={label} />
+        {action.error && <span className="error-text">{action.error}</span>}
+      </div>
+      {state === 'ignored' && (
+        <button className="button small" disabled={action.busy} onClick={() => want(true)}>
+          Download
+        </button>
+      )}
+      {state === 'wanted' && (
+        <button className="button small" disabled={action.busy} onClick={() => want(false)}>
+          Stop wanting
+        </button>
+      )}
+      {(state === 'imported' || state === 'downloading') && (
+        <a className="button small" href={href(`/releases?media=${media.id}`)}>
+          Releases
+        </a>
+      )}
+    </article>
   )
 }
