@@ -71,6 +71,10 @@ On first start a `config/config.toml` is created; add your TMDB key, indexers
 and optionally a password, then `docker compose restart`. The UI is on port
 8080.
 
+Prowlarr runs alongside it, on port 9696, with its data in `prowlarr/`. Add
+trackers there, then add each one to unified as an indexer with the url
+`http://prowlarr:9696/<id>/api` and Prowlarr's API key.
+
 Only traffic from the tunnel's address goes through Mullvad, and only the
 torrent engine uses that address. The web UI, Prowlarr and TMDB use the normal
 network, and nothing outside the container is affected. Without `wg0.conf` the

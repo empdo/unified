@@ -21,3 +21,29 @@ services:
       - ./media:/media
     ports:
       - "8080:8080"
+
+  # Indexer manager. Add trackers in its UI (port 9696), then add each one to
+  # unified under Settings → Indexers as http://prowlarr:9696/<id>/api with
+  # Prowlarr's API key (Prowlarr: Settings → General).
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Europe/Stockholm
+    volumes:
+      - ./prowlarr:/config
+    ports:
+      - "9696:9696"
+
+  # Only needed for trackers behind Cloudflare. Uncomment, then in Prowlarr add
+  # it under Settings → Indexers → Proxies as http://flaresolverr:8191 and tag
+  # the trackers that need it.
+  # flaresolverr:
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   container_name: flaresolverr
+  #   restart: unless-stopped
+  #   environment:
+  #     TZ: Europe/Stockholm

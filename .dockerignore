@@ -4,3 +4,4 @@ config/
 media/
 ui/node_modules/
 ui/dist/
+prowlarr/
