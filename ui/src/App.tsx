@@ -9,6 +9,7 @@ import MediaPage from './pages/Media'
 import Add from './pages/Add'
 import ReleasesPage from './pages/Releases'
 import Downloads from './pages/Downloads'
+import StoragePage from './pages/Storage'
 import SettingsPage from './pages/Settings'
 
 export default function App() {
@@ -33,6 +34,9 @@ export default function App() {
     case 'downloads':
       page = <Downloads />
       break
+    case 'storage':
+      page = <StoragePage />
+      break
     case 'settings':
       page = <SettingsPage />
       break
@@ -41,6 +45,7 @@ export default function App() {
   }
 
   const active = status.data?.status.active.length ?? 0
+  const lowSpace = status.data?.status.disk.low ?? false
   return (
     <StatusContext.Provider value={status.data}>
       <header className="masthead">
@@ -57,6 +62,9 @@ export default function App() {
           </a>
           <a className={section === 'downloads' ? 'current' : ''} href={href('/downloads')}>
             Downloads{active > 0 && ` (${active})`}
+          </a>
+          <a className={section === 'storage' ? 'current' : ''} href={href('/storage')}>
+            Storage{lowSpace && <span className="tab-alert"> (low)</span>}
           </a>
           <a className={section === 'settings' ? 'current' : ''} href={href('/settings')}>
             Settings

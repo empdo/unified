@@ -17,6 +17,14 @@ The UI has the library with posters, a page per movie or show, search, the
 releases found for anything (Grab downloads one of them yourself, even one
 the ranking rejected), downloads with progress, and settings.
 
+The Storage tab shows what the download, movie and TV folders take, their
+largest items, and the free space on their disks.
+Nothing new is grabbed when it would leave less than `min_free_gb` free (20 GB
+by default) where downloads go. With `notify_url` set (an ntfy topic, a
+Discord webhook, or any URL that takes a plain text POST), unified sends a
+message when something is imported, a download fails, the VPN drops, or disk
+space runs low.
+
 Finished downloads keep seeding until they have uploaded `seed_ratio` times
 their size (0: no limit), or until unified stops; seeding does not resume
 after a restart. Indexers,

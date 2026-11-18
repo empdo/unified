@@ -24,6 +24,12 @@ type Config struct {
 	// Finished downloads stop seeding once they have uploaded this many times
 	// their size; 0 seeds for as long as unified runs.
 	SeedRatio float64 `toml:"seed_ratio"`
+	// Nothing new is downloaded when it would leave less than this much free
+	// space for downloads; 0 turns the check off.
+	MinFreeGB float64 `toml:"min_free_gb"`
+	// Where to send notifications: an ntfy topic URL, a Discord webhook, or
+	// any URL that takes a plain text POST. Empty sends none.
+	NotifyURL string `toml:"notify_url"`
 	// Network interface all torrent traffic is bound to, e.g. "wg0-mullvad".
 	VPNInterface string `toml:"vpn_interface"`
 	// Password for the web UI; empty means no login.
@@ -31,6 +37,8 @@ type Config struct {
 	Quality  Quality   `toml:"quality"`
 	Indexers []Indexer `toml:"indexer"`
 }
+
+const DefaultMinFreeGB = 20
 
 type Quality struct {
 	// Accepted resolutions, most preferred first.
@@ -66,6 +74,15 @@ listen_port = 42069
 # Stop seeding a finished download once it has uploaded this many times its
 # size. 0 keeps seeding for as long as unified runs.
 seed_ratio = 1.0
+
+# Don't start downloads that would leave less than this much free space (GB)
+# where downloads go. 0 turns the check off.
+min_free_gb = 20.0
+
+# Notifications for imports, failed downloads, the VPN and low disk space:
+# an ntfy topic URL (https://ntfy.sh/<topic>), a Discord webhook URL, or any
+# URL that accepts a plain text POST. Leave empty for none.
+notify_url = ""
 
 # Bind all torrent traffic to this network interface, so it stops instead of
 # leaking if the VPN drops. The Mullvad app on Linux uses "wg0-mullvad"; run
@@ -136,11 +153,16 @@ func Load(path string) (*Config, error) {
 // loadFile reads the config file as written, without environment overrides.
 func loadFile(path string) (*Config, error) {
 	var c Config
-	if _, err := toml.DecodeFile(path, &c); err != nil {
+	md, err := toml.DecodeFile(path, &c)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("no config at %s, run `unified init` first", path)
 		}
 		return nil, err
+	}
+	// Config files from before the setting existed.
+	if !md.IsDefined("min_free_gb") {
+		c.MinFreeGB = DefaultMinFreeGB
 	}
 	if err := c.normalize(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -157,6 +179,9 @@ func (c *Config) normalize() error {
 	}
 	if c.SeedRatio < 0 {
 		return fmt.Errorf("seed_ratio cannot be negative")
+	}
+	if c.MinFreeGB < 0 {
+		return fmt.Errorf("min_free_gb cannot be negative")
 	}
 	if len(c.Quality.Resolutions) == 0 {
 		c.Quality.Resolutions = []string{"1080p", "720p"}

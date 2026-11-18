@@ -1,5 +1,6 @@
 import { api, type MediaSummary, type Progress } from '../api'
 import { Notice, Poster, ProgressBar, Spinner, StateBadge } from '../components'
+import { DiskWarning } from '../disk'
 import { plural, rate, timeLeft } from '../format'
 import { useAction, useData } from '../hooks'
 import { href } from '../router'
@@ -26,6 +27,7 @@ export default function Library() {
           Add an indexer in <a href={href('/settings')}>Settings</a>, or nothing can be downloaded.
         </Notice>
       )}
+      <DiskWarning />
       <Tonight titles={new Map(all.map((m) => [m.id, m.title]))} />
       {library.error && <Notice kind="error">{library.error}</Notice>}
       {library.loading && !library.data && <Spinner label="Loading library…" />}

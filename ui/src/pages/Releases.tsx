@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import { api, type Candidate } from '../api'
 import { Notice, Spinner } from '../components'
+import { DiskWarning, spaceQuestion } from '../disk'
 import { bytes } from '../format'
 import { useAction, useData } from '../hooks'
 import { href } from '../router'
+import { useStatus } from '../status'
 
 export default function ReleasesPage({ params }: { params: URLSearchParams }) {
   const media = Number(params.get('media'))
@@ -13,6 +15,7 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
   const r = releases.data
   const accepted = r?.candidates.filter((c) => !c.reject).length ?? 0
   const grab = useAction()
+  const disk = useStatus()?.status.disk
   // Grabbed releases, most recent first; they move to the top of the table.
   const [grabbed, setGrabbed] = useState<string[]>([])
   const candidates = r
@@ -24,6 +27,8 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
 
   const pick = async (c: Candidate) => {
     if (c.reject && !confirm(`This release was rejected: ${c.reject}. Grab it anyway?`)) return
+    const space = spaceQuestion(disk, c.size)
+    if (space && !confirm(space)) return
     if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c))) {
       setGrabbed((g) => [c.title, ...g.filter((t) => t !== c.title)])
       window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -40,6 +45,7 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
       <div className="page-head">
         <h1>Releases{r && <> for “{r.query}”</>}</h1>
       </div>
+      <DiskWarning />
       {releases.error && <Notice kind="error">{releases.error}</Notice>}
       {releases.loading && <Spinner label="Searching indexers…" />}
       {r?.errors.map((e) => (

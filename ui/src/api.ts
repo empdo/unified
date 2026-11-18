@@ -19,12 +19,55 @@ export interface Progress {
   ratio: number
 }
 
+export interface Volume {
+  /** The directories on this filesystem: Downloads, Movies, TV. */
+  labels: string[]
+  free: number
+  total: number
+  error?: string
+}
+
+export interface DiskStatus {
+  volumes: Volume[]
+  /** Free space for downloads once the active ones have finished. */
+  available: number
+  /** Space kept free; 0 when not checked. */
+  minFree: number
+  /** New downloads are held back for lack of space. */
+  low: boolean
+  error?: string
+}
+
+export interface FolderUsage {
+  label: string
+  path: string
+  /** Bytes the folder takes on disk. */
+  size: number
+  /** Of size, files hardlinked elsewhere too (stored once). */
+  linked: number
+  files: number
+  /** Top-level entries, largest first. */
+  entries: { name: string; size: number }[]
+  /** The disk the folder is on. */
+  free: number
+  total: number
+  sameDiskAs: string[]
+  error?: string
+}
+
+export interface StorageReport {
+  folders: FolderUsage[]
+  disk: DiskStatus
+  measuredAt: string
+}
+
 export interface Status {
   active: Progress[]
   seeding: Progress[]
   log: string[]
   vpn: string
   vpnError: string
+  disk: DiskStatus
 }
 
 export interface StatusResponse {
@@ -109,6 +152,9 @@ export interface Settings {
   quality: Quality
   /** 0 means no limit. */
   seedRatio: number
+  /** 0 turns the free space check off. */
+  minFreeGB: number
+  notifyURL: string
   passwordSet: boolean
   passwordFromEnv: boolean
   fixed: {
@@ -128,6 +174,8 @@ export interface SettingsUpdate {
   indexers: Indexer[]
   quality: Quality
   seedRatio: number
+  minFreeGB: number
+  notifyURL: string
   /** Omitted: unchanged. Empty string: remove the password. */
   password?: string
 }
@@ -183,4 +231,6 @@ export const api = {
   settings: () => request<Settings>('GET', 'api/settings'),
   saveSettings: (s: SettingsUpdate) => request<void>('PUT', 'api/settings', s),
   testIndexer: (ix: Indexer) => request<{ ok: boolean; error?: string }>('POST', 'api/indexers/test', ix),
+  storage: (fresh = false) => request<StorageReport>('GET', `api/storage${fresh ? '?fresh=1' : ''}`),
+  testNotify: (url: string) => request<{ ok: boolean; error?: string }>('POST', 'api/notify/test', { url }),
 }

@@ -13,8 +13,10 @@ import (
 	"github.com/anacrolix/torrent"
 
 	"unified/internal/config"
+	"unified/internal/disk"
 	"unified/internal/engine"
 	"unified/internal/importer"
+	"unified/internal/notify"
 	"unified/internal/release"
 	"unified/internal/store"
 )
@@ -91,6 +93,7 @@ type runner struct {
 	lines    []string
 	vpn      string // interface and addresses, "" when not bound
 	vpnErr   string
+	disk     DiskStatus
 }
 
 // Status is what the web UI shows about the runner.
@@ -100,6 +103,19 @@ type Status struct {
 	Log     []string   `json:"log"` // newest first
 	VPN     string     `json:"vpn"`
 	VPNErr  string     `json:"vpnError"`
+	Disk    DiskStatus `json:"disk"`
+}
+
+// DiskStatus is the free space for downloads and the library.
+type DiskStatus struct {
+	Volumes []disk.Volume `json:"volumes"`
+	// Free space for downloads once the active ones have finished.
+	Available uint64 `json:"available"`
+	// The space kept free; 0 when not checked.
+	MinFree uint64 `json:"minFree"`
+	// Low is set while new downloads are held back for lack of space.
+	Low   bool   `json:"low"`
+	Error string `json:"error,omitempty"`
 }
 
 func newRunner(ctx context.Context, cfg func() *config.Config, st *store.Store) (*runner, error) {
@@ -277,8 +293,74 @@ func (r *runner) Snapshot() Status {
 	}
 	return Status{
 		Active: append([]Progress(nil), r.snapshot...), Seeding: append([]Progress(nil), r.seeds...),
-		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr,
+		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr, Disk: r.disk,
 	}
+}
+
+// available is the free space for downloads, less what the active downloads
+// still need.
+func (r *runner) available() (uint64, error) {
+	free, err := disk.Free(r.cfg().DownloadDir)
+	if err != nil {
+		return 0, err
+	}
+	for _, a := range r.active {
+		if engine.HasInfo(a.t) {
+			free -= min(free, uint64(max(a.t.Length()-a.t.BytesCompleted(), 0)))
+		}
+	}
+	return free, nil
+}
+
+// minFree is the space to keep free for downloads, 0 when not checked.
+func (r *runner) minFree() uint64 { return uint64(r.cfg().MinFreeGB * (1 << 30)) }
+
+// checkDisk updates the disk status, logging and notifying when space runs
+// low or recovers, and reports whether new downloads may start.
+func (r *runner) checkDisk() bool {
+	c := r.cfg()
+	d := DiskStatus{
+		Volumes: disk.Volumes([]disk.Dir{
+			{Label: "Downloads", Path: c.DownloadDir},
+			{Label: "Movies", Path: c.MoviesDir},
+			{Label: "TV", Path: c.TVDir},
+		}),
+		MinFree: r.minFree(),
+	}
+	avail, err := r.available()
+	if err != nil {
+		d.Error = err.Error()
+	}
+	d.Available = avail
+	d.Low = err == nil && d.MinFree > 0 && avail < d.MinFree
+
+	r.mu.Lock()
+	changed := d.Low != r.disk.Low
+	r.disk = d
+	r.mu.Unlock()
+	if changed && d.Low {
+		msg := fmt.Sprintf("Only %s free for downloads, less than the %s to keep free. Nothing new is downloaded until there is more space.",
+			engine.Size(int64(avail)), engine.Size(int64(d.MinFree)))
+		r.logf("%s", msg)
+		r.notify("Low on disk space", msg)
+	} else if changed {
+		r.logf("enough free space again (%s), downloads resume", engine.Size(int64(avail)))
+	}
+	return !d.Low
+}
+
+// notify sends a notification, if they are set up, without holding up the
+// caller.
+func (r *runner) notify(title, message string) {
+	u := r.cfg().NotifyURL
+	if u == "" {
+		return
+	}
+	go func() {
+		if err := notify.Send(r.ctx, u, title, message); err != nil && r.ctx.Err() == nil {
+			r.logf("could not send a notification: %v", err)
+		}
+	}()
 }
 
 // checkVPN updates the VPN status, logging changes, and reports whether
@@ -296,8 +378,10 @@ func (r *runner) checkVPN() bool {
 	r.mu.Unlock()
 	if changed && err != nil {
 		r.logf("VPN down, torrents paused: %v", err)
+		r.notify("VPN down", fmt.Sprintf("Torrents are paused until it is back: %v", err))
 	} else if changed {
 		r.logf("VPN is back up, torrents resumed")
+		r.notify("VPN back up", "Torrents resumed.")
 	}
 	if err != nil {
 		now := time.Now()
@@ -333,6 +417,7 @@ func (r *runner) loop(keepRunning bool) error {
 	pending := true // wanted items may need a search
 	for {
 		up := r.checkVPN()
+		r.checkDisk()
 		if pending && up {
 			if err := r.grabWanted(); err != nil {
 				return err
@@ -529,6 +614,10 @@ func (r *runner) grabWanted() error {
 		r.logf("%d items wanted, but no indexers are configured", len(wanted))
 		return nil
 	}
+	if len(wanted) > 0 && !r.checkDisk() {
+		r.logf("%d items wanted, but disk space is low; not searching", len(wanted))
+		return nil
+	}
 	type seasonKey struct {
 		media  int64
 		season int
@@ -590,10 +679,14 @@ func (r *runner) grab(items []store.Item, w release.Want) bool {
 	for i, it := range items {
 		ids[i] = it.ID
 	}
-	attempts := 0
+	attempts, tooBig := 0, 0
 	for _, c := range cands {
 		if c.Reject != "" || attempts == maxAttempts {
 			break
+		}
+		if !r.fits(c.Size) {
+			tooBig++
+			continue
 		}
 		attempts++
 		dl, err := r.start(ids, c.Title, c.Link)
@@ -604,7 +697,11 @@ func (r *runner) grab(items []store.Item, w release.Want) bool {
 		r.logf("  grabbed [%d] %s (%s, %d seeders)", dl.ID, c.Title, engine.Size(c.Size), c.Seeders)
 		return true
 	}
-	r.logf("  no acceptable release found")
+	if tooBig > 0 {
+		r.logf("  %d acceptable releases would leave less than %s free", tooBig, engine.Size(int64(r.minFree())))
+	} else {
+		r.logf("  no acceptable release found")
+	}
 	return false
 }
 
@@ -635,6 +732,17 @@ func (r *runner) start(ids []int64, title, link string) (store.Download, error) 
 	}
 	r.track(dl, t)
 	return dl, nil
+}
+
+// fits reports whether a download of size bytes leaves the space to keep
+// free. Unknown sizes and space are given the benefit of the doubt.
+func (r *runner) fits(size int64) bool {
+	minFree := r.minFree()
+	if minFree == 0 || size <= 0 {
+		return true
+	}
+	avail, err := r.available()
+	return err != nil || avail >= minFree && avail-minFree >= uint64(size)
 }
 
 func (r *runner) inClient(hash string) bool {
@@ -677,6 +785,7 @@ func (r *runner) step(a *activeDownload) (finished bool, err error) {
 
 func (r *runner) fail(a *activeDownload, why string) error {
 	r.logf("[%d] failed (%s), blocklisting and looking for another release", a.dl.ID, why)
+	r.notify("Download failed", fmt.Sprintf("%s failed (%s). Looking for another release.", a.dl.Name, why))
 	a.t.Drop()
 	return r.st.FailDownload(a.dl.ID)
 }
@@ -700,11 +809,20 @@ func (r *runner) finish(a *activeDownload) error {
 		files = append(files, importer.File{Path: f.Path(), Size: f.Length()})
 	}
 	results, err := importer.Import(r.cfg(), m, items, a.t.Name(), files)
+	var imported []store.Item
 	for _, res := range results {
 		if err := r.st.SetImported(res.ItemID, res.Dest); err != nil {
 			return err
 		}
 		r.logf("[%d] imported %s", a.dl.ID, res.Dest)
+		for _, it := range items {
+			if it.ID == res.ItemID {
+				imported = append(imported, it)
+			}
+		}
+	}
+	if len(imported) > 0 {
+		r.notify("Imported", describe(m, imported)+" is in your library.")
 	}
 	if err != nil {
 		return err
@@ -721,4 +839,30 @@ func (r *runner) done(a *activeDownload) error {
 	}
 	r.seeding[a.dl.ID] = a
 	return nil
+}
+
+// describe names a movie, or some episodes of a show: "Severance S02E03 -
+// Who Is Alive?", "Severance season 2 (10 episodes)".
+func describe(m store.Media, items []store.Item) string {
+	title := m.Title
+	if m.Year > 0 {
+		title = fmt.Sprintf("%s (%d)", m.Title, m.Year)
+	}
+	if !m.IsShow() || len(items) == 0 {
+		return title
+	}
+	if len(items) == 1 {
+		it := items[0]
+		s := fmt.Sprintf("%s S%02dE%02d", m.Title, it.Season, it.Episode)
+		if it.Title != "" {
+			s += " - " + it.Title
+		}
+		return s
+	}
+	for _, it := range items[1:] {
+		if it.Season != items[0].Season {
+			return fmt.Sprintf("%s (%d episodes)", m.Title, len(items))
+		}
+	}
+	return fmt.Sprintf("%s season %d (%d episodes)", m.Title, items[0].Season, len(items))
 }

@@ -11,10 +11,14 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"unified/internal/config"
+	"unified/internal/disk"
+	"unified/internal/notify"
 	"unified/internal/release"
 	"unified/internal/store"
 	"unified/internal/tmdb"
@@ -32,6 +36,11 @@ type server struct {
 	conf *config.Live
 	st   *store.Store
 	run  *runner
+
+	// The last storage report; walking the library takes a moment.
+	storageMu   sync.Mutex
+	storageAt   time.Time
+	storageLast []folderView
 }
 
 func cmdServe(ctx context.Context, st *store.Store, args []string) error {
@@ -87,6 +96,8 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("GET /api/settings", s.settings)
 	api.HandleFunc("PUT /api/settings", s.saveSettings)
 	api.HandleFunc("POST /api/indexers/test", s.testIndexer)
+	api.HandleFunc("POST /api/notify/test", s.testNotify)
+	api.HandleFunc("GET /api/storage", s.storage)
 	api.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("no such API endpoint"))
 	})
@@ -597,6 +608,8 @@ func (s *server) settings(w http.ResponseWriter, r *http.Request) {
 			MaxMovieGB: c.Quality.MaxMovieGB, MaxEpisodeGB: c.Quality.MaxEpisodeGB, MinSeeders: c.Quality.MinSeeders,
 		},
 		"seedRatio":       c.SeedRatio,
+		"minFreeGB":       c.MinFreeGB,
+		"notifyURL":       c.NotifyURL,
 		"passwordSet":     live.Password != "",
 		"passwordFromEnv": config.FromEnv("password"),
 		// Shown for reference; these change in the config file and need a restart.
@@ -626,8 +639,10 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		TMDBKey  string        `json:"tmdbKey"`
 		Indexers []indexerView `json:"indexers"`
 		Quality  qualityView   `json:"quality"`
-		// nil leaves it as it is.
+		// nil leaves these as they are.
 		SeedRatio *float64 `json:"seedRatio"`
+		MinFreeGB *float64 `json:"minFreeGB"`
+		NotifyURL *string  `json:"notifyURL"`
 		// nil leaves the password as it is; "" removes it.
 		Password *string `json:"password"`
 	}
@@ -653,6 +668,12 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.SeedRatio != nil {
 			c.SeedRatio = *req.SeedRatio
+		}
+		if req.MinFreeGB != nil {
+			c.MinFreeGB = *req.MinFreeGB
+		}
+		if req.NotifyURL != nil {
+			c.NotifyURL = *req.NotifyURL
 		}
 		if req.Password != nil {
 			c.Password = *req.Password
@@ -681,4 +702,86 @@ func (s *server) testIndexer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *server) testNotify(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if err := notify.Send(r.Context(), req.URL, "unified", "Notifications work."); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// Storage.
+
+type folderView struct {
+	Label string `json:"label"`
+	Path  string `json:"path"`
+	disk.Folder
+	// The filesystem the folder is on, and the other folders on it.
+	Free       uint64   `json:"free"`
+	Total      uint64   `json:"total"`
+	SameDiskAs []string `json:"sameDiskAs"`
+	Error      string   `json:"error,omitempty"`
+}
+
+// storageCache is how long a storage report is reused.
+const storageCache = 30 * time.Second
+
+// storage reports what each of the download, movie and TV folders takes,
+// with their largest entries, and the free space on their disks.
+func (s *server) storage(w http.ResponseWriter, r *http.Request) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	if time.Since(s.storageAt) > storageCache || r.URL.Query().Has("fresh") {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		folders, err := measureFolders(ctx, s.conf.Get())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.storageAt, s.storageLast = time.Now(), folders
+	}
+	writeJSON(w, map[string]any{
+		"folders":    s.storageLast,
+		"disk":       s.run.Snapshot().Disk,
+		"measuredAt": s.storageAt,
+	})
+}
+
+func measureFolders(ctx context.Context, c *config.Config) ([]folderView, error) {
+	dirs := []disk.Dir{{Label: "Downloads", Path: c.DownloadDir}, {Label: "Movies", Path: c.MoviesDir}, {Label: "TV", Path: c.TVDir}}
+	volumes := disk.Volumes(dirs)
+	var out []folderView
+	for _, d := range dirs {
+		f := folderView{Label: d.Label, Path: d.Path, SameDiskAs: []string{}}
+		for _, v := range volumes {
+			if slices.Contains(v.Labels, d.Label) {
+				f.Free, f.Total, f.Error = v.Free, v.Total, v.Error
+				for _, l := range v.Labels {
+					if l != d.Label {
+						f.SameDiskAs = append(f.SameDiskAs, l)
+					}
+				}
+			}
+		}
+		folder, err := disk.Measure(ctx, d.Path)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("measuring %s took too long", d.Path)
+		}
+		if err != nil && f.Error == "" {
+			f.Error = err.Error()
+		}
+		f.Folder = folder
+		f.Entries = f.Entries[:min(len(f.Entries), 100)]
+		out = append(out, f)
+	}
+	return out, nil
 }

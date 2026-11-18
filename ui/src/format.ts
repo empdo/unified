@@ -1,4 +1,5 @@
 export function bytes(n: number): string {
+  if (n >= 2 ** 40) return `${(n / 2 ** 40).toFixed(2)} TB`
   if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`
   return `${Math.round(n / 1024)} KB`

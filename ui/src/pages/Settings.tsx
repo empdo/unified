@@ -10,6 +10,8 @@ interface Form {
   indexers: Indexer[]
   quality: Quality
   seedRatio: number
+  minFreeGB: number
+  notifyURL: string
   newPassword: string
   removePassword: boolean
 }
@@ -19,6 +21,8 @@ const toForm = (s: Settings): Form => ({
   indexers: s.indexers,
   quality: s.quality,
   seedRatio: s.seedRatio,
+  minFreeGB: s.minFreeGB,
+  notifyURL: s.notifyURL,
   newPassword: '',
   removePassword: false,
 })
@@ -51,6 +55,8 @@ export default function SettingsPage() {
         indexers: form.indexers.map((ix) => ({ name: ix.name.trim(), url: ix.url.trim(), apiKey: ix.apiKey.trim() })),
         quality: form.quality,
         seedRatio: form.seedRatio,
+        minFreeGB: form.minFreeGB,
+        notifyURL: form.notifyURL.trim(),
         password: form.removePassword ? '' : form.newPassword || undefined,
       }),
     )
@@ -133,6 +139,28 @@ export default function SettingsPage() {
           help="Stop seeding once a download has uploaded this many times its size. 0 seeds until unified stops."
         >
           <NumberInput value={form.seedRatio} onChange={(seedRatio) => update({ seedRatio })} />
+        </Field>
+      </Section>
+
+      <Section title="Storage" hint="Free space where downloads go is checked before anything new is downloaded.">
+        <Field
+          label="Keep free (GB)"
+          help="Releases that would leave less than this free are not grabbed. 0 turns the check off."
+        >
+          <NumberInput value={form.minFreeGB} step={5} onChange={(minFreeGB) => update({ minFreeGB })} />
+        </Field>
+      </Section>
+
+      <Section
+        title="Notifications"
+        hint="A message when something is imported, a download fails, the VPN drops, or disk space runs low."
+      >
+        <Field
+          label="Notification URL"
+          help="An ntfy topic (https://ntfy.sh/your-topic), a Discord webhook URL, or any URL that accepts a plain text POST. Empty sends none."
+          group
+        >
+          <NotifyInput value={form.notifyURL} onChange={(notifyURL) => update({ notifyURL })} />
         </Field>
       </Section>
 
@@ -270,6 +298,37 @@ function NumberInput({ value, onChange, step = 0.5 }: { value: number; onChange:
       value={value}
       onChange={(e) => onChange(e.target.value === '' ? 0 : Number(e.target.value))}
     />
+  )
+}
+
+function NotifyInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const test = useAction()
+  const [result, setResult] = useState<{ ok: boolean; error?: string }>()
+  const run = () => {
+    setResult(undefined)
+    test.run(async () => setResult(await api.testNotify(value.trim())))
+  }
+  return (
+    <>
+      <span className="secret">
+        <input
+          aria-label="Notification URL"
+          value={value}
+          placeholder="https://ntfy.sh/your-topic"
+          spellCheck={false}
+          onChange={(e) => {
+            onChange(e.target.value)
+            setResult(undefined)
+          }}
+        />
+        <button type="button" className="button small" onClick={run} disabled={test.busy || !value.trim()}>
+          {test.busy ? 'Sending…' : 'Send test'}
+        </button>
+      </span>
+      {result?.ok && <span className="ok">Sent</span>}
+      {result && !result.ok && <span className="error-text">{result.error}</span>}
+      {test.error && <span className="error-text">{test.error}</span>}
+    </>
   )
 }
 

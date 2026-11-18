@@ -399,6 +399,26 @@ section > h2 { margin-bottom: 12px; }
 .tonight-side .button { border-color: var(--strip-text); color: var(--strip-text); }
 .tonight-side .button:hover:not(:disabled) { background: var(--strip-track); }
 
+/* Storage */
+
+.tab-alert { color: var(--failed); }
+.folders { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; align-items: start; }
+.folder-head { display: flex; flex-direction: column; gap: 2px; }
+.folder-head code { color: var(--muted); }
+.folder-size { display: flex; align-items: baseline; gap: 10px; }
+.folder-size strong { font: 30px/1 var(--display); }
+.folder > p.muted { margin: 0; }
+.folder-disk { display: flex; flex-direction: column; gap: 6px; }
+.disk-bar { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; display: flex; }
+.disk-this { background: var(--ink); }
+.disk-other { background: var(--line-strong); }
+.entries { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.entries li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 12px; }
+.entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.entry-size { color: var(--muted); font-variant-numeric: tabular-nums; }
+.entry-bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+.entry-bar > span { display: block; height: 100%; background: var(--accent); }
+
 /* Library: listings */
 
 .listings { display: flex; flex-wrap: wrap; gap: 24px 36px; align-items: flex-start; }
