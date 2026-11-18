@@ -28,6 +28,8 @@ export interface Progress {
   best: number
   /** When it started downloading (not while queued). */
   started?: string
+  /** When it is given up on, and another release tried, unless it makes progress. */
+  givesUpAt?: string
   /** A queued download's place in line, from 1. */
   position?: number
   /** A seed waiting for a seeding slot. */

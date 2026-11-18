@@ -61,13 +61,20 @@ export function stuckReason(p: Progress): string | undefined {
   if (!p.hasInfo || p.done > 0) return undefined
   const minutes = p.started ? (Date.now() - Date.parse(p.started)) / 60000 : 0
   if (minutes < 1) return undefined
+  const reason = swarmReason(p, minutes)
+  if (!p.givesUpAt) return reason
+  const at = new Date(p.givesUpAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+  return `${reason} Another release is tried at ${at} unless it starts.`
+}
+
+function swarmReason(p: Progress, minutes: number): string {
   if (p.peers === 0) {
     return p.known === 0
       ? 'No peers found: nobody seems to be sharing this release right now.'
       : `Knows of ${p.known} peers but can't connect to any of them.`
   }
   if (p.best === 0) {
-    return `None of the ${p.peers} connected peers has any of it yet, so there is no seeder to download from. Try another release with Fail.`
+    return `None of the ${p.peers} connected peers has any of it yet, so there is no seeder to download from.`
   }
   const who = p.seeders > 0 ? plural(p.seeders, 'seeder') : `peers with up to ${Math.round(p.best * 100)}% of it`
   return `Connected to ${who}, but nothing has arrived in ${Math.round(minutes)} minutes: they aren't letting us download (choking). See Peer details.`

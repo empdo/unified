@@ -122,3 +122,23 @@ func TestCancelQueued(t *testing.T) {
 		t.Errorf("%d unfinished downloads left", len(dls))
 	}
 }
+
+func TestGiveUpAt(t *testing.T) {
+	start := time.Date(2026, 11, 18, 20, 0, 0, 0, time.Local)
+	for _, c := range []struct {
+		name     string
+		seedSeen time.Time
+		done     int64
+		want     time.Time
+		why      string
+	}{
+		{"nothing and no seeders", start, 0, start.Add(noSeederTimeout), "no seeders"},
+		{"a peer has some lately", start.Add(18 * time.Minute), 0, start.Add(stallTimeout), "stalled"},
+		{"has some already", start, 1 << 20, start.Add(stallTimeout), "stalled"},
+	} {
+		at, why := giveUpAt(start, c.seedSeen, c.done)
+		if !at.Equal(c.want) || why != c.why {
+			t.Errorf("%s: %v %q, want %v %q", c.name, at.Format("15:04"), why, c.want.Format("15:04"), c.why)
+		}
+	}
+}

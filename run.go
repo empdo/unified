@@ -29,6 +29,10 @@ const (
 	// long is blocklisted and replaced with the next best one.
 	metadataTimeout = 3 * time.Minute
 	stallTimeout    = 20 * time.Minute
+	// A download that has nothing yet is given up on sooner when no
+	// connected peer has any of it either: no seeder is reachable, and
+	// waiting rarely changes that.
+	noSeederTimeout = 5 * time.Minute
 	// Releases to try per item before giving up for this round.
 	maxAttempts = 5
 	// When running continuously, wanted items with no release yet (and
@@ -45,6 +49,8 @@ type activeDownload struct {
 	started  bool
 	lastDone int64
 	progress time.Time
+	// When a connected peer last had any of the torrent.
+	seedSeen time.Time
 	// For the download rate shown in the UI.
 	rateDone int64
 	rateAt   time.Time
@@ -80,8 +86,10 @@ type Progress struct {
 	Seeders int     `json:"seeders"`
 	Known   int     `json:"known"`
 	Best    float64 `json:"best"`
-	// When it started, to tell a slow start from a stuck one.
-	Started time.Time `json:"started,omitzero"`
+	// When it started, to tell a slow start from a stuck one, and when it
+	// is given up on unless it makes progress.
+	Started   time.Time `json:"started,omitzero"`
+	GivesUpAt time.Time `json:"givesUpAt,omitzero"`
 	// Waiting for a slot: a queued download's place in line (from 1), or a
 	// seed that waits to seed.
 	Position int  `json:"position,omitempty"`
@@ -634,7 +642,7 @@ func (r *runner) checkVPN() bool {
 	if err != nil {
 		now := time.Now()
 		for _, a := range r.active {
-			a.added, a.progress = now, now
+			a.added, a.progress, a.seedSeen = now, now, now
 		}
 	}
 	return err == nil
@@ -820,6 +828,9 @@ func (r *runner) publish() {
 		p.UTP, p.TCP, _ = engine.Conns(a.t)
 		p.Seeders, p.Known, p.Best = engine.Swarm(a.t)
 		p.Started = a.added
+		if engine.HasInfo(a.t) {
+			p.GivesUpAt, _ = giveUpAt(a.progress, a.seedSeen, a.lastDone)
+		}
 		if engine.HasInfo(a.t) && a.t.Length() > 0 {
 			p.HasInfo = true
 			p.Done, p.Total = a.t.BytesCompleted(), a.t.Length()
@@ -880,7 +891,7 @@ func (r *runner) resume() error {
 
 func (r *runner) track(dl store.Download, mediaID int64, t *torrent.Torrent) {
 	now := time.Now()
-	r.active[dl.ID] = &activeDownload{dl: dl, mediaID: mediaID, t: t, added: now, progress: now, maxConns: -1}
+	r.active[dl.ID] = &activeDownload{dl: dl, mediaID: mediaID, t: t, added: now, progress: now, seedSeen: now, maxConns: -1}
 	r.balanceConns()
 	r.publish()
 }
@@ -1135,13 +1146,29 @@ func (r *runner) step(a *activeDownload) (finished bool, err error) {
 	if done := a.t.BytesCompleted(); done != a.lastDone {
 		a.lastDone, a.progress = done, time.Now()
 	}
+	if _, _, best := engine.Swarm(a.t); best > 0 {
+		a.seedSeen = time.Now()
+	}
 	if a.t.Complete().Bool() {
 		return true, r.finish(a)
 	}
-	if time.Since(a.progress) > stallTimeout {
-		return true, r.fail(a, "stalled")
+	if at, why := giveUpAt(a.progress, a.seedSeen, a.lastDone); time.Now().After(at) {
+		return true, r.fail(a, why)
 	}
 	return false, nil
+}
+
+// giveUpAt returns when a download is given up on, and why: once it has made
+// no progress for stallTimeout, or sooner when it has nothing at all and no
+// connected peer has had any of it for noSeederTimeout.
+func giveUpAt(progress, seedSeen time.Time, done int64) (time.Time, string) {
+	at, why := progress.Add(stallTimeout), "stalled"
+	if done == 0 {
+		if t := seedSeen.Add(noSeederTimeout); t.Before(at) {
+			at, why = t, "no seeders"
+		}
+	}
+	return at, why
 }
 
 func (r *runner) fail(a *activeDownload, why string) error {
