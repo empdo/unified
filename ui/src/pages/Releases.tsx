@@ -13,12 +13,21 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
   const r = releases.data
   const accepted = r?.candidates.filter((c) => !c.reject).length ?? 0
   const grab = useAction()
-  const [grabbed, setGrabbed] = useState<string>()
+  // Grabbed releases, most recent first; they move to the top of the table.
+  const [grabbed, setGrabbed] = useState<string[]>([])
+  const candidates = r
+    ? [
+        ...grabbed.flatMap((t) => r.candidates.filter((c) => c.title === t)),
+        ...r.candidates.filter((c) => !grabbed.includes(c.title)),
+      ]
+    : []
 
   const pick = async (c: Candidate) => {
     if (c.reject && !confirm(`This release was rejected: ${c.reject}. Grab it anyway?`)) return
-    setGrabbed(undefined)
-    if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c))) setGrabbed(c.title)
+    if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c))) {
+      setGrabbed((g) => [c.title, ...g.filter((t) => t !== c.title)])
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    }
   }
 
   return (
@@ -39,9 +48,9 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
         </Notice>
       ))}
       {grab.error && <Notice kind="error">Could not grab it: {grab.error}</Notice>}
-      {grabbed && (
+      {grabbed.length > 0 && (
         <Notice>
-          Grabbed {grabbed}. Follow it on the <a href={href('/downloads')}>Downloads</a> page.
+          Grabbed {grabbed[0]}. Follow it on the <a href={href('/downloads')}>Downloads</a> page.
         </Notice>
       )}
       {r && (
@@ -62,8 +71,11 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
                 </tr>
               </thead>
               <tbody>
-                {r.candidates.map((c) => (
-                  <tr key={c.title} className={c.reject ? 'rejected' : ''}>
+                {candidates.map((c) => (
+                  <tr
+                    key={c.title}
+                    className={grabbed.includes(c.title) ? 'grabbed' : c.reject ? 'rejected' : ''}
+                  >
                     <td>
                       <div className="release-name">{c.title}</div>
                       <div className="chips">
@@ -79,9 +91,13 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
                     <td className="right">{c.seeders >= 0 ? c.seeders : '?'}</td>
                     <td>{c.reject ? <span className="small">{c.reject}</span> : <span className="ok">Acceptable</span>}</td>
                     <td>
-                      <button className="button small" disabled={grab.busy} onClick={() => pick(c)}>
-                        Grab
-                      </button>
+                      {grabbed.includes(c.title) ? (
+                        <span className="grabbed-label">✓ Grabbed</span>
+                      ) : (
+                        <button className="button small" disabled={grab.busy} onClick={() => pick(c)}>
+                          Grab
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

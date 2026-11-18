@@ -42,7 +42,7 @@ export default function Library() {
               <h2>Shows</h2>
               <span className="muted small">{plural(shows.length, 'show')}</span>
             </div>
-            {shows.length === 0 && <p className="muted">No shows yet. Switch the search to Show to add one.</p>}
+            {shows.length === 0 && <p className="muted">No shows yet.</p>}
             <div className="show-grid">
               {shows.map((m) => (
                 <ShowCard key={m.id} media={m} downloads={active.get(m.id) ?? []} />

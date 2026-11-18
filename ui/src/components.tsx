@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import type { Progress } from './api'
 import { bytes, rate, stateLabel } from './format'
 
-export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'sm' | 'md' | 'lg' }) {
+export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'xs' | 'sm' | 'md' | 'lg' }) {
   const [failed, setFailed] = useState(false)
   if (!src || failed) {
     return (

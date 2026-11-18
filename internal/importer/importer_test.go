@@ -3,6 +3,7 @@ package importer
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"unified/internal/config"
@@ -115,6 +116,82 @@ func TestDelete(t *testing.T) {
 	for _, p := range []string{other, outside, cfg.TVDir, cfg.DownloadDir} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("%s was deleted: %v", p, err)
+		}
+	}
+}
+
+func TestImportSubtitles(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{DownloadDir: filepath.Join(root, "dl"), TVDir: filepath.Join(root, "tv")}
+	files := []File{
+		{Path: "Show.S01.Pack/Show.S01E01.mkv", Size: 10},
+		{Path: "Show.S01.Pack/Show.S01E01.en.srt", Size: 1},
+		{Path: "Show.S01.Pack/Show.S01E02.mkv", Size: 10},
+		{Path: "Show.S01.Pack/Subs/Show.S01E02/2_English.srt", Size: 1},
+		{Path: "Show.S01.Pack/Subs/Show.S01E02/3_English [SDH].srt", Size: 1},
+		{Path: "Show.S01.Pack/Subs/Show.S01E02/4_Swedish.Forced.srt", Size: 1},
+		{Path: "Show.S01.Pack/Subs/Show.S01E02/5_English.srt", Size: 1},
+		{Path: "Show.S01.Pack/Subs/Show.S01E03/2_English.srt", Size: 1}, // its episode is not wanted
+	}
+	for _, f := range files {
+		p := filepath.Join(cfg.DownloadDir, f.Path)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	season := filepath.Join(cfg.TVDir, "Show (2020)", "Season 01")
+	// Left over from an earlier release of episode 1.
+	stale := filepath.Join(season, "Show - S01E01.fr.srt")
+	os.MkdirAll(season, 0o755)
+	os.WriteFile(stale, []byte("old"), 0o644)
+
+	m := store.Media{Kind: "show", Title: "Show", Year: 2020}
+	items := []store.Item{{ID: 1, Season: 1, Episode: 1}, {ID: 2, Season: 1, Episode: 2}}
+	if _, err := Import(cfg, m, items, "Show.S01.Pack", files); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(season)
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	want := []string{
+		"Show - S01E01.en.srt",
+		"Show - S01E01.mkv",
+		"Show - S01E02.2.en.srt",
+		"Show - S01E02.en.sdh.srt",
+		"Show - S01E02.en.srt",
+		"Show - S01E02.mkv",
+		"Show - S01E02.sv.forced.srt",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("library has\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	// Deleting the videos takes their subtitles, and the downloaded copies, with them.
+	err := Delete(cfg, []string{filepath.Join(season, "Show - S01E01.mkv"), filepath.Join(season, "Show - S01E02.mkv")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(season); !os.IsNotExist(err) {
+		t.Errorf("season directory still exists")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DownloadDir, files[3].Path)); !os.IsNotExist(err) {
+		t.Errorf("downloaded subtitle still exists")
+	}
+}
+
+func TestSubtitleName(t *testing.T) {
+	for _, c := range []struct{ video, sub, want string }{
+		{"It.2017/It.2017.mkv", "It.2017/It.2017.srt", "It (2017).srt"},
+		{"It.2017/It.2017.mkv", "It.2017/It.2017.eng.HI.srt", "It (2017).en.sdh.srt"},
+		{"M/M.mkv", "M/Subs/English (Forced).ass", "It (2017).en.forced.ass"},
+		{"M/M.mkv", "M/Subs/Movie.2017.1080p.srt", "It (2017).srt"},
+		{"M/M.mkv", "M/Subs/svenska.SRT", "It (2017).sv.srt"},
+	} {
+		if got := subtitleName("It (2017)", c.video, c.sub, map[string]bool{}); got != c.want {
+			t.Errorf("subtitleName(%q) = %q, want %q", c.sub, got, c.want)
 		}
 	}
 }

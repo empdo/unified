@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"unified/internal/config"
 	"unified/internal/release"
@@ -31,8 +32,13 @@ var videoExts = map[string]bool{
 	".mkv": true, ".mp4": true, ".avi": true, ".m4v": true, ".mov": true, ".wmv": true, ".ts": true, ".webm": true,
 }
 
-// Import links the video files that match the given items into the library
-// and reports which items were satisfied.
+var subtitleExts = map[string]bool{
+	".srt": true, ".ass": true, ".ssa": true, ".sub": true, ".idx": true, ".vtt": true, ".sup": true,
+}
+
+// Import links the video files that match the given items into the library,
+// along with the subtitle files that come with them, and reports which items
+// were satisfied.
 func Import(cfg *config.Config, m store.Media, items []store.Item, torrentName string, files []File) ([]Result, error) {
 	var videos []File
 	for _, f := range files {
@@ -52,6 +58,8 @@ func Import(cfg *config.Config, m store.Media, items []store.Item, torrentName s
 		}
 	}
 
+	subs := subtitlesFor(m, items, chosen, files)
+
 	var out []Result
 	for _, it := range items {
 		v, ok := chosen[it.ID]
@@ -62,9 +70,164 @@ func Import(cfg *config.Config, m store.Media, items []store.Item, torrentName s
 		if err := link(filepath.Join(cfg.DownloadDir, v.Path), dest); err != nil {
 			return out, fmt.Errorf("importing %s: %w", v.Path, err)
 		}
+		// Subtitles of whatever this replaced would be out of sync with it.
+		for _, old := range sidecars(dest) {
+			os.Remove(old)
+		}
+		stem := strings.TrimSuffix(dest, filepath.Ext(dest))
+		taken := map[string]bool{}
+		for _, sub := range subs[it.ID] {
+			name := subtitleName(stem, v.Path, sub.Path, taken)
+			if err := link(filepath.Join(cfg.DownloadDir, sub.Path), name); err != nil {
+				return out, fmt.Errorf("importing %s: %w", sub.Path, err)
+			}
+		}
 		out = append(out, Result{ItemID: it.ID, Dest: dest})
 	}
 	return out, nil
+}
+
+// subtitlesFor assigns the download's subtitle files to the items whose
+// video was chosen. A subtitle belongs to a video when it is named after it
+// in the same directory (Movie.mkv, Movie.en.srt), or, for a show, when its
+// name or directory names the episode (Subs/Show.S01E02/2_English.srt).
+// When only one video was chosen, every other subtitle goes with it.
+func subtitlesFor(m store.Media, items []store.Item, chosen map[int64]File, files []File) map[int64][]File {
+	out := map[int64][]File{}
+	for _, f := range files {
+		if !subtitleExts[strings.ToLower(filepath.Ext(f.Path))] {
+			continue
+		}
+		if id, ok := subtitleItem(m, items, chosen, f); ok {
+			out[id] = append(out[id], f)
+		}
+	}
+	return out
+}
+
+func subtitleItem(m store.Media, items []store.Item, chosen map[int64]File, sub File) (int64, bool) {
+	for id, v := range chosen {
+		stem := strings.TrimSuffix(v.Path, filepath.Ext(v.Path))
+		if strings.HasPrefix(sub.Path, stem+".") {
+			return id, true
+		}
+	}
+	if m.IsShow() {
+		info := release.Parse(filepath.Base(sub.Path))
+		if info.Episode == 0 {
+			info = release.Parse(filepath.Base(filepath.Dir(sub.Path)))
+		}
+		if info.Episode != 0 {
+			for _, it := range items {
+				season, episode := it.Scene()
+				if _, ok := chosen[it.ID]; ok && info.Season == season && info.Episode == episode {
+					return it.ID, true
+				}
+			}
+			return 0, false
+		}
+	}
+	if len(chosen) == 1 {
+		for id := range chosen {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// subtitleName names a subtitle after the library video it goes with,
+// keeping the language and the forced and hearing-impaired tags found at the
+// end of its name, as media servers expect: "Movie (2020).en.forced.srt". A
+// name already taken by another subtitle gets a number: "Movie (2020).2.en.srt".
+func subtitleName(videoStem, videoPath, subPath string, taken map[string]bool) string {
+	ext := strings.ToLower(filepath.Ext(subPath))
+	// Tags of a subtitle named after the download's video follow its name.
+	from := strings.TrimSuffix(subPath, filepath.Ext(subPath))
+	video := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
+	if rest, ok := strings.CutPrefix(from, video+"."); ok {
+		from = rest
+	} else if from == video {
+		from = ""
+	} else {
+		from = filepath.Base(from)
+	}
+	words := strings.FieldsFunc(from, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	var lang string
+	var forced, sdh bool
+	// Read tags from the end until something that is not one.
+	for i := len(words) - 1; i >= 0; i-- {
+		w := strings.ToLower(words[i])
+		switch {
+		case w == "forced" || w == "foreign":
+			forced = true
+		case w == "sdh" || w == "hi" || w == "cc":
+			sdh = true
+		case languages[w] != "" && lang == "":
+			lang = languages[w]
+		case strings.Trim(w, "0123456789") == "":
+			// Track numbers, as in 2_English.srt.
+		default:
+			i = 0
+		}
+	}
+	tags := ""
+	if lang != "" {
+		tags += "." + lang
+	}
+	if sdh {
+		tags += ".sdh"
+	}
+	if forced {
+		tags += ".forced"
+	}
+	name := videoStem + tags + ext
+	for n := 2; taken[name]; n++ {
+		name = fmt.Sprintf("%s.%d%s%s", videoStem, n, tags, ext)
+	}
+	taken[name] = true
+	return name
+}
+
+// languages maps language names and codes seen in subtitle file names to
+// ISO 639-1 codes.
+var languages = func() map[string]string {
+	m := map[string]string{}
+	for _, l := range [][]string{
+		{"en", "eng", "english"}, {"sv", "swe", "swedish", "svenska"}, {"no", "nor", "nob", "nb", "norwegian", "norsk"},
+		{"da", "dan", "danish", "dansk"}, {"fi", "fin", "finnish", "suomi"}, {"is", "ice", "isl", "icelandic"},
+		{"de", "ger", "deu", "german", "deutsch"}, {"fr", "fre", "fra", "french", "francais"},
+		{"es", "spa", "spanish", "espanol", "castellano"}, {"it", "ita", "italian", "italiano"},
+		{"nl", "dut", "nld", "dutch"}, {"pt", "por", "portuguese", "brazilian"}, {"pl", "pol", "polish"},
+		{"ru", "rus", "russian"}, {"uk", "ukr", "ukrainian"}, {"cs", "cze", "ces", "czech"},
+		{"sk", "slo", "slk", "slovak"}, {"hu", "hun", "hungarian"}, {"ro", "rum", "ron", "romanian"},
+		{"bg", "bul", "bulgarian"}, {"hr", "hrv", "croatian"}, {"sr", "srp", "serbian"}, {"sl", "slv", "slovenian"},
+		{"el", "gre", "ell", "greek"}, {"tr", "tur", "turkish"}, {"he", "heb", "hebrew"}, {"ar", "ara", "arabic"},
+		{"fa", "per", "fas", "persian"}, {"hi", "hin", "hindi"}, {"ja", "jpn", "japanese"},
+		{"zh", "chi", "zho", "chinese"}, {"ko", "kor", "korean"}, {"th", "tha", "thai"},
+		{"vi", "vie", "vietnamese"}, {"id", "ind", "indonesian"}, {"ms", "may", "msa", "malay"},
+		{"et", "est", "estonian"}, {"lv", "lav", "latvian"}, {"lt", "lit", "lithuanian"},
+	} {
+		for _, k := range l {
+			m[k] = l[0]
+		}
+	}
+	return m
+}()
+
+// sidecars lists the subtitle files named after a library video.
+func sidecars(video string) []string {
+	stem := strings.TrimSuffix(filepath.Base(video), filepath.Ext(video)) + "."
+	entries, _ := os.ReadDir(filepath.Dir(video))
+	var out []string
+	for _, e := range entries {
+		n := e.Name()
+		if e.Type().IsRegular() && strings.HasPrefix(n, stem) && subtitleExts[strings.ToLower(filepath.Ext(n))] {
+			out = append(out, filepath.Join(filepath.Dir(video), n))
+		}
+	}
+	return out
 }
 
 func matches(m store.Media, it store.Item, v File, torrentName string, videoCount int) bool {
@@ -138,12 +301,19 @@ func link(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// Delete removes library files and the download directory copies they were
-// linked from, so the space is freed, along with downloads (files of torrents
-// still in the client) given separately. Directories left empty are removed.
-// Paths outside the library and download directories are left alone.
+// Delete removes library files, with their subtitles, and the download
+// directory copies they were linked from, so the space is freed, along with
+// downloads (files of torrents still in the client) given separately.
+// Directories left empty are removed. Paths outside the library and download
+// directories are left alone.
 func Delete(cfg *config.Config, library, downloads []string) error {
 	roots := []string{cfg.DownloadDir, cfg.MoviesDir, cfg.TVDir}
+	library = append([]string(nil), library...)
+	for _, p := range library {
+		if within(p, roots) != "" {
+			library = append(library, sidecars(p)...)
+		}
+	}
 	var linked []os.FileInfo
 	for _, p := range library {
 		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
