@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api, type Item, type MediaDetail } from '../api'
-import { Notice, Poster, ProgressBar, Spinner, progressText } from '../components'
+import { Busy, Notice, Poster, ProgressBar, Spinner, progressText } from '../components'
 import { plural } from '../format'
 import { useAction, useData } from '../hooks'
 import { href, navigate } from '../router'
@@ -79,13 +79,13 @@ function RemovePanel(props: { media: MediaDetail; downloading: number; close: ()
     .join(' and ')
 
   const deleteFiles = async () => {
-    if (await action.run(() => api.deleteFiles(m.id))) {
+    if (await action.run(() => api.deleteFiles(m.id), 'files')) {
       close()
       reload()
     }
   }
   const remove = async (withFiles: boolean) => {
-    if (await action.run(() => api.removeMedia(m.id, withFiles))) navigate('/')
+    if (await action.run(() => api.removeMedia(m.id, withFiles), withFiles ? 'all' : 'keep')) navigate('/')
   }
 
   return (
@@ -98,19 +98,25 @@ function RemovePanel(props: { media: MediaDetail; downloading: number; close: ()
       <ul className="remove-options">
         <li className="remove-option">
           <button className="button danger" disabled={action.busy} onClick={deleteFiles}>
-            Delete files
+            <Busy on={action.pending === 'files'} label="Deleting…">
+              Delete files
+            </Busy>
           </button>
           <p>Keep {what} in the library, with nothing wanted, so it isn't downloaded again.</p>
         </li>
         <li className="remove-option">
           <button className="button danger" disabled={action.busy} onClick={() => remove(true)}>
-            Delete files and remove
+            <Busy on={action.pending === 'all'} label="Deleting…">
+              Delete files and remove
+            </Busy>
           </button>
           <p>Delete everything on disk and remove {what} from unified.</p>
         </li>
         <li className="remove-option">
           <button className="button" disabled={action.busy} onClick={() => remove(false)}>
-            Remove, keep files
+            <Busy on={action.pending === 'keep'} label="Removing…">
+              Remove, keep files
+            </Busy>
           </button>
           <p>Remove {what} from unified and leave its files where they are.</p>
         </li>
@@ -144,7 +150,7 @@ function MovieWantButton({ media, item }: { media: { reload: () => void }; item:
       disabled={action.busy}
       onClick={() => action.run(() => api.wantItem(item.id, want)).then(media.reload)}
     >
-      {want ? 'Download' : 'Stop wanting'}
+      <Busy on={action.busy}>{want ? 'Download' : 'Stop wanting'}</Busy>
     </button>
   )
 }

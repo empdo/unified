@@ -1,7 +1,9 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"maps"
@@ -47,6 +49,11 @@ type activeDownload struct {
 	rateDone int64
 	rateAt   time.Time
 	rate     float64
+	// The connection limit last set, -1 before the first.
+	maxConns int
+	// For seeding: since when, and whether it waits for a seeding slot.
+	seedSince time.Time
+	paused    bool
 }
 
 // Progress is a snapshot of one active download, for the web UI.
@@ -65,6 +72,20 @@ type Progress struct {
 	// as a multiple of the size.
 	Uploaded int64   `json:"uploaded"`
 	Ratio    float64 `json:"ratio"`
+	// Peer connections over uTP and TCP.
+	UTP int `json:"utp"`
+	TCP int `json:"tcp"`
+	// Connected peers with the whole torrent, peers known of, and the
+	// largest share of the torrent (0 to 1) any connected peer has.
+	Seeders int     `json:"seeders"`
+	Known   int     `json:"known"`
+	Best    float64 `json:"best"`
+	// When it started, to tell a slow start from a stuck one.
+	Started time.Time `json:"started,omitzero"`
+	// Waiting for a slot: a queued download's place in line (from 1), or a
+	// seed that waits to seed.
+	Position int  `json:"position,omitempty"`
+	Paused   bool `json:"paused,omitempty"`
 }
 
 // runner drives items through wanted -> downloading -> imported. Everything
@@ -75,6 +96,8 @@ type runner struct {
 	st     *store.Store
 	eng    *engine.Engine
 	active map[int64]*activeDownload
+	// Downloads waiting for a slot in active, oldest first.
+	queue []queuedDownload
 	// Imported downloads still in the client, until they reach the seed ratio.
 	seeding map[int64]*activeDownload
 	// Items with no acceptable release this round; not searched again until
@@ -90,13 +113,16 @@ type runner struct {
 	grabs   chan grabRequest
 	removes chan removeRequest
 
-	mu       sync.Mutex
-	snapshot []Progress
-	seeds    []Progress
-	lines    []string
-	vpn      string // interface and addresses, "" when not bound
-	vpnErr   string
-	disk     DiskStatus
+	mu        sync.Mutex
+	snapshot  []Progress
+	queued    []Progress
+	seeds     []Progress
+	limits    LimitStatus
+	limitsSet bool
+	lines     []string
+	vpn       string // interface and addresses, "" when not bound
+	vpnErr    string
+	disk      DiskStatus
 	// Where the search for each wanted item stands, by item, and what is
 	// being searched for right now.
 	searches  map[int64]ItemSearch
@@ -131,6 +157,8 @@ type Status struct {
 	VPNErr  string       `json:"vpnError"`
 	Disk    DiskStatus   `json:"disk"`
 	Search  SearchStatus `json:"search"`
+	Queued  []Progress   `json:"queued"` // downloads waiting for a slot, in order
+	Limits  LimitStatus  `json:"limits"`
 }
 
 // DiskStatus is the free space for downloads and the library.
@@ -309,6 +337,11 @@ func (r *runner) remove(req removeRequest) error {
 			delete(r.seeding, id)
 		}
 	}
+	for _, q := range r.unqueue(func(q queuedDownload) bool { return q.mediaID == req.media }) {
+		if err := r.st.CancelDownload(q.dl.ID); err != nil {
+			return err
+		}
+	}
 	defer r.publish()
 
 	m, err := r.st.Media(req.media)
@@ -352,8 +385,8 @@ func (r *runner) removeItems(req removeRequest) error {
 	}
 	// covers reports whether a download brings any of the items, and whether
 	// it brings nothing else.
-	covers := func(a *activeDownload) (some, only bool, err error) {
-		items, err := r.st.DownloadItems(a.dl.ID)
+	covers := func(id int64) (some, only bool, err error) {
+		items, err := r.st.DownloadItems(id)
 		if err != nil {
 			return false, false, err
 		}
@@ -376,7 +409,7 @@ func (r *runner) removeItems(req removeRequest) error {
 		}
 	}
 	for id, a := range r.active {
-		some, only, err := covers(a)
+		some, only, err := covers(id)
 		if err != nil {
 			return err
 		}
@@ -389,6 +422,20 @@ func (r *runner) removeItems(req removeRequest) error {
 			}
 		}
 	}
+	var coverErr error
+	unqueued := r.unqueue(func(q queuedDownload) bool {
+		some, only, err := covers(q.dl.ID)
+		coverErr = cmp.Or(coverErr, err)
+		return some && only
+	})
+	if coverErr != nil {
+		return coverErr
+	}
+	for _, q := range unqueued {
+		if err := r.st.CancelDownload(q.dl.ID); err != nil {
+			return err
+		}
+	}
 	// A seeding torrent loses the files of the removed items, so it stops;
 	// the files of other items stay, as when it reaches the seed ratio.
 	// Cancelling leaves finished downloads alone.
@@ -396,7 +443,7 @@ func (r *runner) removeItems(req removeRequest) error {
 		if req.cancel {
 			break
 		}
-		some, only, err := covers(a)
+		some, only, err := covers(id)
 		if err != nil {
 			return err
 		}
@@ -468,6 +515,7 @@ func (r *runner) Snapshot() Status {
 	}
 	return Status{
 		Active: append([]Progress(nil), r.snapshot...), Seeding: append([]Progress(nil), r.seeds...),
+		Queued: append([]Progress(nil), r.queued...), Limits: r.limits,
 		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr, Disk: r.disk,
 		Search: SearchStatus{Current: r.searching, Queued: queued},
 	}
@@ -494,8 +542,8 @@ func (r *runner) setSearch(items []store.Item, state, note string) {
 	}
 }
 
-// available is the free space for downloads, less what the active downloads
-// still need.
+// available is the free space for downloads, less what the active and
+// queued downloads still need.
 func (r *runner) available() (uint64, error) {
 	free, err := disk.Free(r.cfg().DownloadDir)
 	if err != nil {
@@ -505,6 +553,9 @@ func (r *runner) available() (uint64, error) {
 		if engine.HasInfo(a.t) {
 			free -= min(free, uint64(max(a.t.Length()-a.t.BytesCompleted(), 0)))
 		}
+	}
+	for _, q := range r.queue {
+		free -= min(free, uint64(max(q.size, 0)))
 	}
 	return free, nil
 }
@@ -607,6 +658,7 @@ func (r *runner) loop(keepRunning bool) error {
 		return err
 	}
 	r.refreshScenes()
+	r.applyRateLimits()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	retry := time.NewTicker(retryInterval)
@@ -615,6 +667,7 @@ func (r *runner) loop(keepRunning bool) error {
 	for {
 		up := r.checkVPN()
 		r.checkDisk()
+		r.applyRateLimits()
 		if pending && up {
 			if err := r.grabWanted(); err != nil {
 				return err
@@ -622,7 +675,7 @@ func (r *runner) loop(keepRunning bool) error {
 			pending = false
 		}
 		r.publish()
-		if len(r.active) == 0 && !keepRunning {
+		if len(r.active) == 0 && len(r.queue) == 0 && !keepRunning {
 			r.logf("nothing left to download")
 			return nil
 		}
@@ -644,21 +697,16 @@ func (r *runner) loop(keepRunning bool) error {
 				if err := r.fail(a, "marked as failed"); err != nil {
 					return err
 				}
-			} else if err := r.st.FailDownload(id); err != nil {
-				return err
+			} else {
+				r.unqueue(func(q queuedDownload) bool { return q.dl.ID == id })
+				if err := r.st.FailDownload(id); err != nil {
+					return err
+				}
 			}
 			pending = true
 			continue
 		case g := <-r.grabs:
-			if !up {
-				g.reply <- errors.New("the VPN is down, torrents are paused")
-				continue
-			}
-			dl, err := r.start(g.items, g.title, g.link)
-			if err == nil {
-				r.logf("grabbed [%d] %s (chosen by hand)", dl.ID, dl.Name)
-			}
-			g.reply <- err
+			r.grabByHand(g, up)
 			continue
 		case req := <-r.removes:
 			req.reply <- r.remove(req)
@@ -678,8 +726,61 @@ func (r *runner) loop(keepRunning bool) error {
 				pending = true
 			}
 		}
+		if err := r.fillSlots(); err != nil {
+			return err
+		}
 		r.stopSeeding()
+		r.limitSeeds()
+		r.balanceConns()
 	}
+}
+
+func (r *runner) grabByHand(g grabRequest, up bool) {
+	if !up {
+		g.reply <- errors.New("the VPN is down, torrents are paused")
+		return
+	}
+	dl, err := r.start(g.items, g.title, g.link, 0)
+	if err == nil {
+		r.logf("grabbed [%d] %s (chosen by hand)", dl.ID, dl.Name)
+	}
+	g.reply <- err
+}
+
+// serveRequests handles grabs and removals asked for from the web UI, so
+// they need not wait for a whole search round. It does not block.
+func (r *runner) serveRequests() {
+	for {
+		select {
+		case g := <-r.grabs:
+			r.grabByHand(g, true) // a search round only runs while the VPN is up
+		case req := <-r.removes:
+			req.reply <- r.remove(req)
+		default:
+			return
+		}
+	}
+}
+
+// stillWanted returns the items that are still wanted, which a request
+// served during a search round may have changed.
+func (r *runner) stillWanted(items []store.Item) ([]store.Item, error) {
+	var out []store.Item
+	for _, it := range items {
+		cur, err := r.st.Item(it.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // removed from the library
+		}
+		if err != nil {
+			return nil, err
+		}
+		if cur.State == store.Wanted {
+			out = append(out, cur)
+		} else {
+			r.setSearch([]store.Item{it}, "", "")
+		}
+	}
+	return out, nil
 }
 
 // stopSeeding removes imported downloads that reached the seed ratio from
@@ -716,6 +817,9 @@ func (r *runner) publish() {
 			ID: a.dl.ID, MediaID: a.mediaID, Name: a.dl.Name,
 			Status: engine.Status(a.t), Peers: a.t.Stats().ActivePeers,
 		}
+		p.UTP, p.TCP, _ = engine.Conns(a.t)
+		p.Seeders, p.Known, p.Best = engine.Swarm(a.t)
+		p.Started = a.added
 		if engine.HasInfo(a.t) && a.t.Length() > 0 {
 			p.HasInfo = true
 			p.Done, p.Total = a.t.BytesCompleted(), a.t.Length()
@@ -732,50 +836,52 @@ func (r *runner) publish() {
 	}
 	sort.Slice(ps, func(i, j int) bool { return ps[i].ID < ps[j].ID })
 
+	var queued []Progress
+	for i, q := range r.queue {
+		queued = append(queued, Progress{
+			ID: q.dl.ID, MediaID: q.mediaID, Name: q.dl.Name, Status: "queued", Total: q.size, Position: i + 1,
+		})
+	}
+
 	var seeds []Progress
 	for _, a := range r.seeding {
 		st := a.t.Stats()
-		seeds = append(seeds, Progress{
+		p := Progress{
 			ID: a.dl.ID, MediaID: a.mediaID, Name: a.dl.Name, Status: engine.Status(a.t),
 			HasInfo: true, Percent: 100, Done: a.t.Length(), Total: a.t.Length(), Peers: st.ActivePeers,
-			Uploaded: st.BytesWrittenData.Int64(), Ratio: seedRatio(a.t),
-		})
+			Uploaded: st.BytesWrittenData.Int64(), Ratio: seedRatio(a.t), Paused: a.paused,
+		}
+		p.UTP, p.TCP, _ = engine.Conns(a.t)
+		seeds = append(seeds, p)
 	}
 	sort.Slice(seeds, func(i, j int) bool { return seeds[i].ID < seeds[j].ID })
 
 	r.mu.Lock()
-	r.snapshot, r.seeds = ps, seeds
+	r.snapshot, r.queued, r.seeds = ps, queued, seeds
 	r.mu.Unlock()
 }
 
-// resume re-adds downloads that were in progress when unified last stopped.
+// resume puts the downloads that were unfinished when unified last stopped
+// back in line, oldest first, and starts as many as there are slots for.
 func (r *runner) resume() error {
 	dls, err := r.st.Downloads(true)
 	if err != nil {
 		return err
 	}
 	for _, dl := range dls {
-		t, err := r.eng.Add(dl.Source)
-		if err != nil {
-			r.logf("cannot resume %s: %v", dl.Name, err)
-			if err := r.st.FailDownload(dl.ID); err != nil {
-				return err
-			}
-			continue
-		}
 		r.logf("resuming %s", dl.Name)
-		r.track(dl, t)
+		r.enqueue(dl, 0)
 	}
-	return nil
+	if !r.checkVPN() {
+		return nil // they start once the VPN is up
+	}
+	return r.fillSlots()
 }
 
-func (r *runner) track(dl store.Download, t *torrent.Torrent) {
+func (r *runner) track(dl store.Download, mediaID int64, t *torrent.Torrent) {
 	now := time.Now()
-	a := &activeDownload{dl: dl, t: t, added: now, progress: now}
-	if items, err := r.st.DownloadItems(dl.ID); err == nil && len(items) > 0 {
-		a.mediaID = items[0].MediaID
-	}
-	r.active[dl.ID] = a
+	r.active[dl.ID] = &activeDownload{dl: dl, mediaID: mediaID, t: t, added: now, progress: now, maxConns: -1}
+	r.balanceConns()
 	r.publish()
 }
 
@@ -851,6 +957,14 @@ func (r *runner) grabWanted() error {
 		names = append(names, ix.Name)
 	}
 	for i, k := range order {
+		r.serveRequests()
+		items, err := r.stillWanted(groups[k])
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			continue
+		}
 		// With every indexer failing, the rest wait until one is back.
 		if until, down := r.indexers.allDown(names); down {
 			var rest []store.Item
@@ -862,7 +976,6 @@ func (r *runner) grabWanted() error {
 			time.AfterFunc(time.Until(until)+5*time.Second, r.Wake)
 			return nil
 		}
-		items := groups[k]
 		m, err := r.st.Media(k.media)
 		if err != nil {
 			return err
@@ -886,6 +999,12 @@ func (r *runner) grabWanted() error {
 			r.setSearch(items, "queued", "")
 		}
 		for _, it := range items {
+			r.serveRequests()
+			if still, err := r.stillWanted([]store.Item{it}); err != nil {
+				return err
+			} else if len(still) == 0 {
+				continue
+			}
 			season, episode := it.Scene()
 			if !r.grab(m, []store.Item{it}, sceneWant(m, all, season, episode)) {
 				r.exhausted[it.ID] = true
@@ -939,7 +1058,7 @@ func (r *runner) grab(m store.Media, items []store.Item, w release.Want) (ok boo
 			continue
 		}
 		attempts++
-		dl, err := r.start(ids, c.Title, c.Link)
+		dl, err := r.start(ids, c.Title, c.Link, c.Size)
 		if err != nil {
 			r.logf("  skipping %s: %v", c.Title, err)
 			continue
@@ -956,32 +1075,34 @@ func (r *runner) grab(m store.Media, items []store.Item, w release.Want) (ok boo
 	return false
 }
 
-// start adds a release to the client and records it as the download for the
-// given items.
-func (r *runner) start(ids []int64, title, link string) (store.Download, error) {
+// start records a release as the download for the given items, and starts
+// it, or queues it when all download slots are taken. size is the release's
+// size as the indexer gave it, 0 when unknown.
+func (r *runner) start(ids []int64, title, link string, size int64) (store.Download, error) {
 	source, err := r.eng.Resolve(r.ctx, link)
 	if err != nil {
 		return store.Download{}, err
 	}
-	t, err := r.eng.Add(source)
+	hash, err := engine.InfoHash(source)
 	if err != nil {
 		return store.Download{}, err
 	}
-	hash := t.InfoHash().HexString()
 	if r.st.HasInfoHash(hash) {
-		// Same torrent as an earlier download, maybe under another name. Only
-		// drop it if it is not the one currently running or seeding.
-		if !r.inClient(hash) {
-			t.Drop()
-		}
+		// Same torrent as an earlier download, maybe under another name.
 		return store.Download{}, errors.New("this torrent was grabbed before")
 	}
 	dl, err := r.st.CreateDownload(hash, title, source, ids)
 	if err != nil {
-		t.Drop()
 		return store.Download{}, err
 	}
-	r.track(dl, t)
+	r.enqueue(dl, size)
+	if err := r.fillSlots(); err != nil {
+		return store.Download{}, err
+	}
+	if _, running := r.active[dl.ID]; !running {
+		r.logf("[%d] queued; %d downloads are running", dl.ID, len(r.active))
+	}
+	r.publish()
 	return dl, nil
 }
 
@@ -994,17 +1115,6 @@ func (r *runner) fits(size int64) bool {
 	}
 	avail, err := r.available()
 	return err != nil || avail >= minFree && avail-minFree >= uint64(size)
-}
-
-func (r *runner) inClient(hash string) bool {
-	for _, set := range []map[int64]*activeDownload{r.active, r.seeding} {
-		for _, a := range set {
-			if a.dl.InfoHash == hash {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // step advances one download and reports whether it left the active set.
@@ -1088,6 +1198,7 @@ func (r *runner) done(a *activeDownload) error {
 	if err := r.st.FinishDownload(a.dl.ID); err != nil {
 		return err
 	}
+	a.seedSince, a.paused = time.Now(), false
 	r.seeding[a.dl.ID] = a
 	return nil
 }

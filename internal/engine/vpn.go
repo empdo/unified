@@ -128,8 +128,7 @@ func (b *binding) configure(cfg *torrent.ClientConfig) {
 		return ""
 	}
 	// The library's TCP sockets dial out from an unspecified address, so they
-	// are not used for outgoing connections; addPeerDialers replaces them.
-	cfg.DialForPeerConns = false
+	// are not used for outgoing connections; tcpDialers replaces them.
 	cfg.HTTPDialContext = b.DialContext
 	cfg.TrackerDialContext = b.DialContext
 	cfg.TrackerListenPacket = b.listenPacket
@@ -139,17 +138,14 @@ func (b *binding) configure(cfg *torrent.ClientConfig) {
 	cfg.DisableWebtorrent = true
 }
 
-// addPeerDialers sets up outgoing peer connections: uTP through the bound UDP
-// sockets themselves, TCP through dialers with a fixed source address.
-func (b *binding) addPeerDialers(client *torrent.Client) {
-	for _, l := range client.Listeners() {
-		if d, ok := l.(torrent.Dialer); ok && strings.HasPrefix(d.DialerNetwork(), "udp") {
-			client.AddDialer(d)
-		}
-	}
+// tcpDialers dials TCP peers from the interface's addresses. uTP needs no
+// such dialers: it goes through the bound UDP sockets themselves.
+func (b *binding) tcpDialers() []torrent.Dialer {
+	var out []torrent.Dialer
 	for _, network := range []string{"tcp4", "tcp6"} {
 		if b.local(network) != nil {
-			client.AddDialer(torrent.NetworkDialer{Network: network, Dialer: b})
+			out = append(out, torrent.NetworkDialer{Network: network, Dialer: b})
 		}
 	}
+	return out
 }

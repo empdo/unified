@@ -48,12 +48,16 @@ export function useData<T>(load: () => Promise<T>, deps: unknown[], pollMs?: num
   return { data, error, loading, reload }
 }
 
-/** Runs an action, tracking whether it is busy and its last error. */
+/**
+ * Runs an action, tracking whether it is busy and its last error. Name the
+ * action with key when several buttons share it, so pending tells which one
+ * is running.
+ */
 export function useAction() {
-  const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<string>()
   const [error, setError] = useState<string>()
-  const run = useCallback(async (action: () => Promise<unknown>) => {
-    setBusy(true)
+  const run = useCallback(async (action: () => Promise<unknown>, key = '') => {
+    setPending(key)
     setError(undefined)
     try {
       await action()
@@ -62,8 +66,8 @@ export function useAction() {
       setError((e as Error).message)
       return false
     } finally {
-      setBusy(false)
+      setPending(undefined)
     }
   }, [])
-  return { busy, error, run }
+  return { busy: pending !== undefined, pending, error, run }
 }

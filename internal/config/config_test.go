@@ -47,3 +47,66 @@ url = "http://a/api"
 		t.Errorf("saved file mode %v, want 0600", info.Mode().Perm())
 	}
 }
+
+func TestDefaultsForOldFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`data_dir = "/d"
+download_dir = "/m/downloads"
+movies_dir = "/m/movies"
+tv_dir = "/m/tv"
+max_active_seeds = 0
+`), 0o600)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Left out: the defaults. Written as 0: no limit, as written.
+	if c.MaxActiveDownloads != 3 || c.MaxConnections != 200 || c.MinFreeGB != DefaultMinFreeGB || c.MaxActiveSeeds != 0 {
+		t.Errorf("got %+v", c)
+	}
+}
+
+func TestTemplateAndRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("UNIFIED_DATA_DIR", filepath.Join(dir, "data"))
+	t.Setenv("UNIFIED_MEDIA_DIR", filepath.Join(dir, "media"))
+	path := filepath.Join(dir, "config.toml")
+	if err := WriteTemplate(path); err != nil {
+		t.Fatal(err)
+	}
+	l, err := NewLive(path)
+	if err != nil {
+		t.Fatalf("the template does not load: %v", err)
+	}
+	c := l.Get()
+	if c.MaxActiveDownloads != 3 || c.MaxActiveSeeds != 3 || c.MaxConnections != 200 || c.MaxUploadKBps != 0 || c.AltSchedule != "" {
+		t.Errorf("template values: %+v", c)
+	}
+
+	err = l.Update(func(c *Config) error {
+		c.MaxDownloadKBps, c.MaxUploadKBps = 5000, 800
+		c.AltDownloadKBps, c.AltUploadKBps, c.AltSchedule = 2000, 200, "08:00-23:00"
+		c.MaxActiveDownloads, c.MaxActiveSeeds, c.MaxConnections = 2, 0, 150
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MaxDownloadKBps != 5000 || r.MaxUploadKBps != 800 || r.AltDownloadKBps != 2000 || r.AltUploadKBps != 200 ||
+		r.AltSchedule != "08:00-23:00" || r.MaxActiveDownloads != 2 || r.MaxActiveSeeds != 0 || r.MaxConnections != 150 {
+		t.Errorf("read back %+v", r)
+	}
+
+	for _, bad := range []func(*Config){
+		func(c *Config) { c.AltSchedule = "evenings" },
+		func(c *Config) { c.MaxUploadKBps = -1 },
+	} {
+		if err := l.Update(func(c *Config) error { bad(c); return nil }); err == nil {
+			t.Error("an invalid setting was saved")
+		}
+	}
+}

@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { api, type Indexer, type Quality, type Settings } from '../api'
+import { api, type Indexer, type Quality, type Settings, type Transfer } from '../api'
 import { Notice, Spinner } from '../components'
 import { useAction, useData } from '../hooks'
 
@@ -12,6 +12,7 @@ interface Form {
   seedRatio: number
   minFreeGB: number
   notifyURL: string
+  transfer: Transfer
   newPassword: string
   removePassword: boolean
 }
@@ -23,6 +24,7 @@ const toForm = (s: Settings): Form => ({
   seedRatio: s.seedRatio,
   minFreeGB: s.minFreeGB,
   notifyURL: s.notifyURL,
+  transfer: s.transfer,
   newPassword: '',
   removePassword: false,
 })
@@ -47,6 +49,8 @@ export default function SettingsPage() {
     setSaved(false)
   }
   const updateQuality = (change: Partial<Quality>) => update({ quality: { ...form.quality, ...change } })
+  const updateTransfer = (change: Partial<Transfer>) => update({ transfer: { ...form.transfer, ...change } })
+  const whole = (v: number) => Math.max(0, Math.round(v))
 
   const submit = async () => {
     const ok = await save.run(() =>
@@ -57,6 +61,7 @@ export default function SettingsPage() {
         seedRatio: form.seedRatio,
         minFreeGB: form.minFreeGB,
         notifyURL: form.notifyURL.trim(),
+        transfer: { ...form.transfer, altSchedule: form.transfer.altSchedule.trim() },
         password: form.removePassword ? '' : form.newPassword || undefined,
       }),
     )
@@ -140,6 +145,75 @@ export default function SettingsPage() {
         >
           <NumberInput value={form.seedRatio} onChange={(seedRatio) => update({ seedRatio })} />
         </Field>
+      </Section>
+
+      <Section
+        title="Speed and connections"
+        hint="Limits for all torrents together; 0 is no limit. A full upload is what slows the rest of the network down, so an upload limit a bit below your connection's upload speed helps most."
+      >
+        <div className="field-row">
+          <Field label="Max download (KiB/s)" help="1000 KiB/s is about 8 Mbit/s.">
+            <NumberInput
+              value={form.transfer.maxDownloadKBps}
+              step={100}
+              onChange={(v) => updateTransfer({ maxDownloadKBps: whole(v) })}
+            />
+          </Field>
+          <Field label="Max upload (KiB/s)">
+            <NumberInput
+              value={form.transfer.maxUploadKBps}
+              step={50}
+              onChange={(v) => updateTransfer({ maxUploadKBps: whole(v) })}
+            />
+          </Field>
+        </div>
+        <div className="field-row">
+          <Field label="Alternative limits from–to" help="Daily, e.g. 08:00-23:00 while people are home. Empty turns them off.">
+            <input
+              value={form.transfer.altSchedule}
+              placeholder="08:00-23:00"
+              spellCheck={false}
+              onChange={(e) => updateTransfer({ altSchedule: e.target.value })}
+            />
+          </Field>
+          <Field label="Alt. download (KiB/s)">
+            <NumberInput
+              value={form.transfer.altDownloadKBps}
+              step={100}
+              onChange={(v) => updateTransfer({ altDownloadKBps: whole(v) })}
+            />
+          </Field>
+          <Field label="Alt. upload (KiB/s)">
+            <NumberInput
+              value={form.transfer.altUploadKBps}
+              step={50}
+              onChange={(v) => updateTransfer({ altUploadKBps: whole(v) })}
+            />
+          </Field>
+        </div>
+        <div className="field-row">
+          <Field label="Downloads at once" help="The rest wait in line.">
+            <NumberInput
+              value={form.transfer.maxActiveDownloads}
+              step={1}
+              onChange={(v) => updateTransfer({ maxActiveDownloads: whole(v) })}
+            />
+          </Field>
+          <Field label="Seeding at once">
+            <NumberInput
+              value={form.transfer.maxActiveSeeds}
+              step={1}
+              onChange={(v) => updateTransfer({ maxActiveSeeds: whole(v) })}
+            />
+          </Field>
+          <Field label="Peer connections" help="In total; too many can overwhelm a home router.">
+            <NumberInput
+              value={form.transfer.maxConnections}
+              step={10}
+              onChange={(v) => updateTransfer({ maxConnections: whole(v) })}
+            />
+          </Field>
+        </div>
       </Section>
 
       <Section title="Storage" hint="Free space where downloads go is checked before anything new is downloaded.">

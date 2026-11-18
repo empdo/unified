@@ -318,6 +318,57 @@ button.icon:disabled { opacity: 0.35; cursor: default; }
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+.spinner-inline { width: 13px; height: 13px; border-color: currentColor; border-top-color: transparent; opacity: 0.8; flex: none; }
+button[aria-busy="true"], button:disabled:has(.spinner-inline) { cursor: progress; }
+
+/* "Download whole season": an admission ticket, with a torn-off stub. */
+.ticket {
+  --notch: 7px;
+  font: inherit;
+  display: inline-flex;
+  align-items: stretch;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+  white-space: nowrap;
+  /* Semicircle notches on both short sides. */
+  -webkit-mask:
+    radial-gradient(circle var(--notch) at 0 50%, #0000 98%, #000) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--notch) at 100% 50%, #0000 98%, #000) right / 51% 100% no-repeat;
+  mask:
+    radial-gradient(circle var(--notch) at 0 50%, #0000 98%, #000) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--notch) at 100% 50%, #0000 98%, #000) right / 51% 100% no-repeat;
+  transition: transform 0.15s, background 0.15s;
+}
+.ticket-stub {
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 calc(var(--notch) + 7px);
+  font: 15px/1 var(--display);
+  letter-spacing: 0.02em;
+  border-right: 2px dashed color-mix(in srgb, var(--accent-text) 55%, transparent);
+}
+.ticket-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 calc(var(--notch) + 12px) 0 12px;
+  font: 700 14px var(--narrow);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.ticket:hover:not(:disabled) { background: var(--accent-hover); transform: rotate(-1.5deg); }
+.ticket:active:not(:disabled) { transform: rotate(-1.5deg) translateY(1px); }
+.ticket:disabled { opacity: 0.55; cursor: default; }
+/* The mask clips anything outside the ticket, so the focus ring goes inside. */
+.ticket:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent-text), inset 0 0 0 4px var(--accent); }
+@media (prefers-reduced-motion: reduce) {
+  .ticket, .ticket:hover:not(:disabled), .ticket:active:not(:disabled) { transform: none; transition: none; }
+}
 
 .empty { text-align: center; padding: 64px 16px; }
 .empty h2 { font: 24px var(--display); margin-bottom: 6px; }
@@ -347,6 +398,8 @@ button.icon:disabled { opacity: 0.35; cursor: default; }
 @keyframes bar-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
 
 .badge-searching { color: var(--wanted); background: var(--wanted-bg); }
+.stuck { color: var(--wanted); }
+.badge-queued { color: var(--ignored); background: var(--ignored-bg); }
 .badge-searching .badge-dot { animation: dot-pulse 0.9s ease-in-out infinite alternate; }
 @keyframes dot-pulse { from { opacity: 1; } to { opacity: 0.25; } }
 

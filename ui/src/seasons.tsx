@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api, type Item, type MediaDetail, type Progress } from './api'
-import { Notice } from './components'
+import { Busy, Notice } from './components'
 import { airDate, episodeCode, plural } from './format'
 import { ItemStatus } from './itemstate'
 import { useAction } from './hooks'
@@ -68,8 +68,10 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; downloads: Pro
           .filter(Boolean)
           .join(' · ')
 
-  const setSeason = (want: boolean) => action.run(() => api.wantSeason(media.id, season.number, want)).then(reload)
-  const setEpisode = (e: Item, want: boolean) => action.run(() => api.wantItem(e.id, want)).then(reload)
+  const setSeason = (want: boolean) =>
+    action.run(() => api.wantSeason(media.id, season.number, want), want ? 'want' : 'stop').then(reload)
+  const setEpisode = (e: Item, want: boolean) => action.run(() => api.wantItem(e.id, want), `ep${e.id}`).then(reload)
+  const doing = (key: string) => action.pending === key
 
   const onDisk = imported + downloading
   const deleteSeason = () => {
@@ -77,17 +79,17 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; downloads: Pro
       .filter(Boolean)
       .join(' and ')
     if (!confirm(`Delete ${what} of ${seasonName(season.number)}? The episodes won't be downloaded again unless you ask for them.`)) return
-    action.run(() => api.deleteSeasonFiles(media.id, season.number)).then(reload)
+    action.run(() => api.deleteSeasonFiles(media.id, season.number), 'delete').then(reload)
   }
   const cancelSeason = () => {
     const rest = wanted > 0 ? ` and stop wanting its other ${plural(wanted, 'missing episode')}` : ''
     if (!confirm(`Cancel the ${plural(downloading, 'downloading episode')} of ${seasonName(season.number)}${rest}? What was downloaded so far is deleted; episodes in your library stay.`)) return
-    action.run(() => api.cancelSeason(media.id, season.number)).then(reload)
+    action.run(() => api.cancelSeason(media.id, season.number), 'cancel').then(reload)
   }
   const deleteEpisode = (e: Item) => {
     const what = e.state === 'downloading' ? 'Stop downloading' : 'Delete the file of'
     if (!confirm(`${what} ${episodeCode(e.season, e.episode)}? It won't be downloaded again unless you ask for it.`)) return
-    action.run(() => api.deleteItemFiles(e.id)).then(reload)
+    action.run(() => api.deleteItemFiles(e.id), `ep${e.id}`).then(reload)
   }
 
   return (
@@ -102,24 +104,35 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; downloads: Pro
             Season releases
           </a>
           {downloading > 0 ? (
-            <button className="button" disabled={action.busy} onClick={cancelSeason}>
-              Cancel downloads
+            <button className="button" disabled={action.busy} aria-busy={doing('cancel')} onClick={cancelSeason}>
+              <Busy on={doing('cancel')} label="Cancelling…">
+                Cancel downloads
+              </Busy>
             </button>
           ) : (
             wanted > 0 && (
-              <button className="button" disabled={action.busy} onClick={() => setSeason(false)}>
-                Stop wanting season
+              <button className="button" disabled={action.busy} aria-busy={doing('stop')} onClick={() => setSeason(false)}>
+                <Busy on={doing('stop')}>Stop wanting season</Busy>
               </button>
             )
           )}
           {ignored > 0 && (
-            <button className="button ink" disabled={action.busy} onClick={() => setSeason(true)}>
-              Download whole season
+            <button className="ticket" disabled={action.busy} aria-busy={doing('want')} onClick={() => setSeason(true)}>
+              <span className="ticket-stub" aria-hidden="true">
+                {season.number === 0 ? 'SP' : `S${String(season.number).padStart(2, '0')}`}
+              </span>
+              <span className="ticket-main">
+                <Busy on={doing('want')} label="Booking…">
+                  Download whole season
+                </Busy>
+              </span>
             </button>
           )}
           {onDisk > 0 && (
-            <button className="button danger" disabled={action.busy} onClick={deleteSeason}>
-              Delete season files
+            <button className="button danger" disabled={action.busy} aria-busy={doing('delete')} onClick={deleteSeason}>
+              <Busy on={doing('delete')} label="Deleting…">
+                Delete season files
+              </Busy>
             </button>
           )}
         </div>
@@ -137,17 +150,19 @@ function SeasonPanel(props: { media: MediaDetail; season: Season; downloads: Pro
             <span className="ep-actions">
               {e.state === 'ignored' && (
                 <button className="button small" disabled={action.busy} onClick={() => setEpisode(e, true)}>
-                  Download
+                  <Busy on={doing(`ep${e.id}`)}>Download</Busy>
                 </button>
               )}
               {e.state === 'wanted' && (
                 <button className="button small" disabled={action.busy} onClick={() => setEpisode(e, false)}>
-                  Stop wanting
+                  <Busy on={doing(`ep${e.id}`)}>Stop wanting</Busy>
                 </button>
               )}
               {(e.state === 'imported' || e.state === 'downloading') && (
                 <button className="button small danger" disabled={action.busy} onClick={() => deleteEpisode(e)}>
-                  {e.state === 'downloading' ? 'Cancel' : 'Delete'}
+                  <Busy on={doing(`ep${e.id}`)} label={e.state === 'downloading' ? 'Cancelling…' : 'Deleting…'}>
+                    {e.state === 'downloading' ? 'Cancel' : 'Delete'}
+                  </Busy>
                 </button>
               )}
               <a className="link" href={href(`/releases?media=${media.id}&season=${e.season}&episode=${e.episode}`)}>

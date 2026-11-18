@@ -17,6 +17,21 @@ export interface Progress {
   /** Seeding downloads: bytes uploaded since unified started, and as a multiple of the size. */
   uploaded: number
   ratio: number
+  /** Peer connections over uTP and TCP. */
+  utp: number
+  tcp: number
+  /** Connected peers with the whole torrent. */
+  seeders: number
+  /** Peers known of, connected or not. */
+  known: number
+  /** The largest share of the torrent (0 to 1) any connected peer has. */
+  best: number
+  /** When it started downloading (not while queued). */
+  started?: string
+  /** A queued download's place in line, from 1. */
+  position?: number
+  /** A seed waiting for a seeding slot. */
+  paused?: boolean
 }
 
 export interface Volume {
@@ -70,6 +85,17 @@ export interface Status {
   disk: DiskStatus
   /** What is being searched for on the indexers, and how many wanted items wait for a search. */
   search: { current: { mediaId: number; label: string } | null; queued: number }
+  /** Downloads waiting for a slot, in order. */
+  queued: Progress[]
+  limits: {
+    /** Bytes per second; 0 is no limit. */
+    download: number
+    upload: number
+    /** The alternative limits are in force. */
+    alt: boolean
+    maxDownloads: number
+    maxSeeds: number
+  }
 }
 
 export interface StatusResponse {
@@ -152,6 +178,19 @@ export interface Quality {
   minSeeders: number
 }
 
+/** Speed limits in KiB/s and counts; 0 is no limit. */
+export interface Transfer {
+  maxDownloadKBps: number
+  maxUploadKBps: number
+  altDownloadKBps: number
+  altUploadKBps: number
+  /** "08:00-23:00", or empty for none. */
+  altSchedule: string
+  maxActiveDownloads: number
+  maxActiveSeeds: number
+  maxConnections: number
+}
+
 export interface Settings {
   tmdbKey: string
   indexers: Indexer[]
@@ -161,6 +200,7 @@ export interface Settings {
   /** 0 turns the free space check off. */
   minFreeGB: number
   notifyURL: string
+  transfer: Transfer
   passwordSet: boolean
   passwordFromEnv: boolean
   fixed: {
@@ -182,6 +222,7 @@ export interface SettingsUpdate {
   seedRatio: number
   minFreeGB: number
   notifyURL: string
+  transfer: Transfer
   /** Omitted: unchanged. Empty string: remove the password. */
   password?: string
 }

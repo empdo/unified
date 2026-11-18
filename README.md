@@ -54,6 +54,37 @@ the address Vite prints; API calls are forwarded to the running server.
 `unified run` exits when all downloads are imported; `unified run --seed` keeps
 seeding until Ctrl-C. Interrupted downloads resume on the next run.
 
+## Sharing the network
+
+Torrents can make the rest of a home network slow, mostly through a full
+upload: the router's queues fill up and everyone's traffic waits behind the
+torrents' (bufferbloat). unified keeps this down in a few ways:
+
+- Outgoing peer connections prefer uTP, which backs off as soon as it sees
+  delay building up. TCP waits two seconds for uTP to connect and is only
+  used for peers without uTP. Incoming TCP is still accepted. The downloads
+  page shows how many connections use each.
+- `max_download_kbps` and `max_upload_kbps` limit all torrents together, in
+  KiB/s (1000 KiB/s is about 8 Mbit/s); 0 is no limit. An upload limit
+  somewhat below your connection's upload speed helps the most.
+  `alt_download_kbps` and `alt_upload_kbps` apply instead during
+  `alt_schedule`, a daily window such as `"08:00-23:00"` (`"22:00-06:00"`
+  runs past midnight). Changes in the settings apply at once.
+- Only `max_active_downloads` torrents download at once and only
+  `max_active_seeds` seed (3 each by default; 0 is no limit). The rest wait
+  their turn, shown as queued; a queued download isn't added to the torrent
+  client yet, so it makes no connections. Interrupted downloads go back in
+  line on the next start.
+- At most 30 connections per torrent, and `max_connections` (200 by default)
+  shared among the running ones, so a home router's connection table doesn't
+  fill up.
+
+These help, but the real fix for bufferbloat is on the router: turn on SQM
+(Smart Queue Management) with fq_codel or CAKE, as OpenWrt, OPNsense,
+pfSense and many consumer routers offer, and set it a little below your
+connection's real speeds. Then a full upload no longer slows everything
+else down, whatever program causes it.
+
 ## VPN
 
 Set `vpn_interface` in the config (the Mullvad app on Linux uses
@@ -95,6 +126,8 @@ The image builds for amd64 and arm64:
 ## Layout
 
     main.go, run.go        CLI and the wanted -> downloading -> imported loop
+    queue.go               download and seeding slots, speed limits, connections
+    indexers.go            backing off indexers that fail
     api.go                 JSON API for the web UI, and serving the built app
     ui/                    the web UI (React, TypeScript, Vite)
     Dockerfile, docker/    container image and its startup script
@@ -104,5 +137,7 @@ The image builds for amd64 and arm64:
     internal/xem           scene numbering and names from TheXEM
     internal/torznab       indexer search
     internal/release       release name parsing and ranking
-    internal/engine        embedded torrent client
+    internal/engine        embedded torrent client; prefers uTP over TCP
     internal/importer      hardlink into the library
+    internal/disk          free space and folder sizes
+    internal/notify        notifications (ntfy, Discord, plain POST)

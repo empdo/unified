@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api, type Candidate } from '../api'
-import { Notice, Spinner } from '../components'
+import { Busy, Notice, Spinner } from '../components'
 import { DiskWarning, spaceQuestion } from '../disk'
 import { bytes } from '../format'
 import { useAction, useData } from '../hooks'
@@ -29,7 +29,7 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
     if (c.reject && !confirm(`This release was rejected: ${c.reject}. Grab it anyway?`)) return
     const space = spaceQuestion(disk, c.size)
     if (space && !confirm(space)) return
-    if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c))) {
+    if (await grab.run(() => api.grab(media, season ?? 0, episode ?? 0, c), c.title)) {
       setGrabbed((g) => [c.title, ...g.filter((t) => t !== c.title)])
       window.scrollTo({ top: 0, behavior: 'smooth' })
     }
@@ -101,7 +101,9 @@ export default function ReleasesPage({ params }: { params: URLSearchParams }) {
                         <span className="grabbed-label">✓ Grabbed</span>
                       ) : (
                         <button className="button small" disabled={grab.busy} onClick={() => pick(c)}>
-                          Grab
+                          <Busy on={grab.pending === c.title} label="Grabbing…">
+                            Grab
+                          </Busy>
                         </button>
                       )}
                     </td>

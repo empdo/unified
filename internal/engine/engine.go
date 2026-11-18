@@ -14,18 +14,43 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"golang.org/x/time/rate"
+)
+
+// Connection limits, lower than the library's (50 per torrent, 25 and 100
+// half-open), which add up to hundreds of connections with a few torrents
+// and can fill a home router's NAT table. qBittorrent allows 100 per torrent
+// but has far fewer torrents running at once.
+const (
+	MaxConnsPerTorrent      = 30
+	halfOpenConnsPerTorrent = 10
+	totalHalfOpenConns      = 50
+)
+
+// Bursts for the rate limiters. A peer may have this much requested from us
+// at once, and the upload burst must cover it even while the limit changes,
+// or the library panics; the library's 1 MiB would let a low limit burst far
+// past itself. The download burst is about a second of traffic, but at
+// least one 16 KiB chunk.
+const (
+	maxPeerRequestData = 256 << 10
+	minDownloadBurst   = 16 << 10
+	maxDownloadBurst   = 1 << 20
 )
 
 type Engine struct {
 	client     *torrent.Client
 	torrentDir string
 	vpn        *binding
+	// Shared by all torrents; changed with SetRateLimits.
+	down, up *rate.Limiter
 }
 
 // New starts a client that stores data in downloadDir and keeps fetched
 // .torrent files in torrentDir. With vpnInterface set, all torrent traffic
 // (peers, DHT, trackers, web seeds) is bound to that interface's addresses,
-// and New fails if the interface is not up.
+// and New fails if the interface is not up. Transfers are not rate limited
+// until SetRateLimits is called.
 func New(downloadDir, torrentDir string, port int, vpnInterface string) (*Engine, error) {
 	for _, d := range []string{downloadDir, torrentDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -37,6 +62,17 @@ func New(downloadDir, torrentDir string, port int, vpnInterface string) (*Engine
 	cfg.ListenPort = port
 	cfg.Seed = true
 	cfg.Slogger = slog.New(slog.DiscardHandler)
+	cfg.EstablishedConnsPerTorrent = MaxConnsPerTorrent
+	cfg.HalfOpenConnsPerTorrent = halfOpenConnsPerTorrent
+	cfg.TotalHalfOpenConns = totalHalfOpenConns
+	cfg.MaxAllocPeerRequestDataPerConn = maxPeerRequestData
+	// Both limiters exist from the start: the library reads them once, and
+	// a nil download limiter could never be turned on later.
+	up := rate.NewLimiter(rate.Inf, maxPeerRequestData)
+	down := rate.NewLimiter(rate.Inf, downloadBurst(0))
+	cfg.UploadRateLimiter, cfg.DownloadRateLimiter = up, down
+	// Outgoing peer connections go through addPeerDialers, which prefers uTP.
+	cfg.DialForPeerConns = false
 	var vpn *binding
 	if vpnInterface != "" {
 		var err error
@@ -49,10 +85,87 @@ func New(downloadDir, torrentDir string, port int, vpnInterface string) (*Engine
 	if err != nil {
 		return nil, err
 	}
+	tcp := tcpDialers(client)
 	if vpn != nil {
-		vpn.addPeerDialers(client)
+		tcp = vpn.tcpDialers()
 	}
-	return &Engine{client: client, torrentDir: torrentDir, vpn: vpn}, nil
+	addPeerDialers(client, tcp)
+	return &Engine{client: client, torrentDir: torrentDir, vpn: vpn, down: down, up: up}, nil
+}
+
+// SetRateLimits limits all downloading and uploading, in bytes per second;
+// 0 is no limit. It applies at once, to transfers already running too.
+func (e *Engine) SetRateLimits(down, up int64) {
+	e.down.SetBurst(downloadBurst(down))
+	e.down.SetLimit(limit(down))
+	// The burst stays at maxPeerRequestData, as requests already accepted
+	// while there was no limit can be that long.
+	e.up.SetLimit(limit(up))
+}
+
+func limit(bytesPerSecond int64) rate.Limit {
+	if bytesPerSecond <= 0 {
+		return rate.Inf
+	}
+	return rate.Limit(bytesPerSecond)
+}
+
+func downloadBurst(bytesPerSecond int64) int {
+	if bytesPerSecond <= 0 {
+		return maxDownloadBurst
+	}
+	return int(max(minDownloadBurst, min(bytesPerSecond, maxDownloadBurst)))
+}
+
+// InfoHash returns the info hash of a magnet URI or a saved .torrent file,
+// without adding it to the client.
+func InfoHash(source string) (string, error) {
+	if strings.HasPrefix(source, "magnet:") {
+		m, err := metainfo.ParseMagnetUri(source)
+		if err != nil {
+			return "", fmt.Errorf("not a valid magnet link: %w", err)
+		}
+		return m.InfoHash.HexString(), nil
+	}
+	mi, err := metainfo.LoadFromFile(source)
+	if err != nil {
+		return "", fmt.Errorf("not a valid .torrent file: %w", err)
+	}
+	return mi.HashInfoBytes().HexString(), nil
+}
+
+// Swarm describes who a torrent is connected to: connected peers that have
+// the whole torrent, peers known from trackers, DHT and other peers, and
+// the largest share of the torrent (0 to 1) any connected peer has. A
+// download stuck at 0% with best at 0 has no one to download from.
+func Swarm(t *torrent.Torrent) (seeders, known int, best float64) {
+	st := t.Stats()
+	if HasInfo(t) && t.NumPieces() > 0 {
+		for _, c := range t.PeerConns() {
+			best = max(best, float64(c.Stats().RemotePieceCount)/float64(t.NumPieces()))
+		}
+	}
+	return st.ConnectedSeeders, st.TotalPeers, best
+}
+
+// WriteStatus writes the client's own report on every torrent and peer
+// connection: which peers choke us, what they have, rates. For debugging.
+func (e *Engine) WriteStatus(w io.Writer) { e.client.WriteStatus(w) }
+
+// Conns counts a torrent's peer connections by transport: uTP, TCP, and
+// anything else (WebRTC).
+func Conns(t *torrent.Torrent) (utp, tcp, other int) {
+	for _, c := range t.PeerConns() {
+		switch {
+		case strings.HasPrefix(c.Network, "udp"):
+			utp++
+		case strings.HasPrefix(c.Network, "tcp"):
+			tcp++
+		default:
+			other++
+		}
+	}
+	return utp, tcp, other
 }
 
 // VPN reports the interface and addresses torrent traffic is bound to ("" when

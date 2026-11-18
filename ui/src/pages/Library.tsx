@@ -1,5 +1,5 @@
 import { api, type MediaSummary, type Progress } from '../api'
-import { Notice, Poster, ProgressBar, Spinner, StateBadge } from '../components'
+import { Busy, Notice, Poster, ProgressBar, Spinner, StateBadge } from '../components'
 import { DiskWarning } from '../disk'
 import { plural, rate, timeLeft } from '../format'
 import { useAction, useData } from '../hooks'
@@ -77,6 +77,7 @@ function Tonight({ titles }: { titles: Map<number, string> }) {
   const search = status.status.search
   const shown = active.slice(0, search.current ? 2 : 3)
   const waiting = search.queued > 0 ? `${search.queued} more waiting` : ''
+  const queued = status.status.queued.length
 
   return (
     <section className="tonight" aria-label="Downloading now">
@@ -88,6 +89,7 @@ function Tonight({ titles }: { titles: Map<number, string> }) {
             : search.current
               ? 'Looking for releases'
               : 'Nothing downloading'}
+          {queued > 0 && `, ${queued} queued`}
         </span>
       </div>
       <div className="tonight-items">
@@ -120,7 +122,9 @@ function Tonight({ titles }: { titles: Map<number, string> }) {
       </div>
       <div className="tonight-side">
         <button className="button" disabled={action.busy} onClick={() => action.run(api.searchNow)}>
-          {action.busy ? 'Searching…' : 'Search for wanted now'}
+          <Busy on={action.busy} label="Starting…">
+            Search for wanted now
+          </Busy>
         </button>
         <span className="small">{action.error ?? 'Also runs by itself every 30 minutes'}</span>
       </div>
@@ -195,12 +199,12 @@ function MovieCard({ media, downloads, reload }: { media: MediaSummary; download
       </div>
       {state === 'ignored' && (
         <button className="button small" disabled={action.busy} onClick={() => want(true)}>
-          Download
+          <Busy on={action.busy}>Download</Busy>
         </button>
       )}
       {state === 'wanted' && (
         <button className="button small" disabled={action.busy} onClick={() => want(false)}>
-          Stop wanting
+          <Busy on={action.busy}>Stop wanting</Busy>
         </button>
       )}
       {(state === 'imported' || state === 'downloading') && (

@@ -30,6 +30,20 @@ type Config struct {
 	// Where to send notifications: an ntfy topic URL, a Discord webhook, or
 	// any URL that takes a plain text POST. Empty sends none.
 	NotifyURL string `toml:"notify_url"`
+	// Speed limits for all torrents, in KiB/s; 0 is no limit. During
+	// AltSchedule ("08:00-23:00"), the alt limits apply instead.
+	MaxDownloadKBps int    `toml:"max_download_kbps"`
+	MaxUploadKBps   int    `toml:"max_upload_kbps"`
+	AltDownloadKBps int    `toml:"alt_download_kbps"`
+	AltUploadKBps   int    `toml:"alt_upload_kbps"`
+	AltSchedule     string `toml:"alt_schedule"`
+	// How many torrents download, and seed, at once; the rest wait their
+	// turn. 0 is no limit.
+	MaxActiveDownloads int `toml:"max_active_downloads"`
+	MaxActiveSeeds     int `toml:"max_active_seeds"`
+	// Peer connections across all running torrents; 0 leaves only the
+	// limit per torrent.
+	MaxConnections int `toml:"max_connections"`
 	// Network interface all torrent traffic is bound to, e.g. "wg0-mullvad".
 	VPNInterface string `toml:"vpn_interface"`
 	// Password for the web UI; empty means no login.
@@ -38,7 +52,16 @@ type Config struct {
 	Indexers []Indexer `toml:"indexer"`
 }
 
+// Defaults for settings a config file leaves out, as files written before
+// the setting existed do.
 const DefaultMinFreeGB = 20
+
+var defaults = map[string]func(*Config){
+	"min_free_gb":          func(c *Config) { c.MinFreeGB = DefaultMinFreeGB },
+	"max_active_downloads": func(c *Config) { c.MaxActiveDownloads = 3 },
+	"max_active_seeds":     func(c *Config) { c.MaxActiveSeeds = 3 },
+	"max_connections":      func(c *Config) { c.MaxConnections = 200 },
+}
 
 type Quality struct {
 	// Accepted resolutions, most preferred first.
@@ -78,6 +101,27 @@ seed_ratio = 1.0
 # Don't start downloads that would leave less than this much free space (GB)
 # where downloads go. 0 turns the check off.
 min_free_gb = 20.0
+
+# Speed limits for all torrents together, in KiB/s (1000 is about 8 Mbit/s).
+# 0 is no limit. A full upload is what makes the rest of the network slow, so
+# a limit somewhat below your connection's upload speed helps most.
+max_download_kbps = 0
+max_upload_kbps   = 0
+
+# Other limits during a daily time window, e.g. "08:00-23:00" for when people
+# are home ("22:00-06:00" runs past midnight). Empty turns it off.
+alt_download_kbps = 0
+alt_upload_kbps   = 0
+alt_schedule      = ""
+
+# How many torrents download, and how many seed, at the same time; the rest
+# wait their turn. 0 is no limit.
+max_active_downloads = 3
+max_active_seeds     = 3
+
+# Peer connections across all running torrents. Too many can overwhelm a home
+# router. 0 leaves only the limit of 30 per torrent.
+max_connections = 200
 
 # Notifications for imports, failed downloads, the VPN and low disk space:
 # an ntfy topic URL (https://ntfy.sh/<topic>), a Discord webhook URL, or any
@@ -160,9 +204,10 @@ func loadFile(path string) (*Config, error) {
 		}
 		return nil, err
 	}
-	// Config files from before the setting existed.
-	if !md.IsDefined("min_free_gb") {
-		c.MinFreeGB = DefaultMinFreeGB
+	for key, set := range defaults {
+		if !md.IsDefined(key) {
+			set(&c)
+		}
 	}
 	if err := c.normalize(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -182,6 +227,19 @@ func (c *Config) normalize() error {
 	}
 	if c.MinFreeGB < 0 {
 		return fmt.Errorf("min_free_gb cannot be negative")
+	}
+	for name, v := range map[string]int{
+		"max_download_kbps": c.MaxDownloadKBps, "max_upload_kbps": c.MaxUploadKBps,
+		"alt_download_kbps": c.AltDownloadKBps, "alt_upload_kbps": c.AltUploadKBps,
+		"max_active_downloads": c.MaxActiveDownloads, "max_active_seeds": c.MaxActiveSeeds,
+		"max_connections": c.MaxConnections,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s cannot be negative", name)
+		}
+	}
+	if _, _, err := ParseWindow(c.AltSchedule); err != nil {
+		return fmt.Errorf("alt_schedule: %w", err)
 	}
 	if len(c.Quality.Resolutions) == 0 {
 		c.Quality.Resolutions = []string{"1080p", "720p"}

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -101,6 +102,7 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("POST /api/indexers/test", s.testIndexer)
 	api.HandleFunc("POST /api/notify/test", s.testNotify)
 	api.HandleFunc("GET /api/storage", s.storage)
+	api.HandleFunc("GET /api/debug/peers", s.debugPeers)
 	api.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("no such API endpoint"))
 	})
@@ -196,6 +198,9 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	if st.Seeding == nil {
 		st.Seeding = []Progress{}
+	}
+	if st.Queued == nil {
+		st.Queued = []Progress{}
 	}
 	if st.Log == nil {
 		st.Log = []string{}
@@ -686,6 +691,18 @@ type indexerView struct {
 	APIKey string `json:"apiKey"`
 }
 
+// transferView is how much bandwidth and how many connections torrents use.
+type transferView struct {
+	MaxDownloadKBps    int    `json:"maxDownloadKBps"`
+	MaxUploadKBps      int    `json:"maxUploadKBps"`
+	AltDownloadKBps    int    `json:"altDownloadKBps"`
+	AltUploadKBps      int    `json:"altUploadKBps"`
+	AltSchedule        string `json:"altSchedule"`
+	MaxActiveDownloads int    `json:"maxActiveDownloads"`
+	MaxActiveSeeds     int    `json:"maxActiveSeeds"`
+	MaxConnections     int    `json:"maxConnections"`
+}
+
 type qualityView struct {
 	Resolutions  []string `json:"resolutions"`
 	PreferCodecs []string `json:"preferCodecs"`
@@ -708,8 +725,12 @@ func (s *server) settings(w http.ResponseWriter, r *http.Request) {
 			Resolutions: nonNil(c.Quality.Resolutions), PreferCodecs: nonNil(c.Quality.PreferCodecs),
 			MaxMovieGB: c.Quality.MaxMovieGB, MaxEpisodeGB: c.Quality.MaxEpisodeGB, MinSeeders: c.Quality.MinSeeders,
 		},
-		"seedRatio":       c.SeedRatio,
-		"minFreeGB":       c.MinFreeGB,
+		"seedRatio": c.SeedRatio,
+		"minFreeGB": c.MinFreeGB,
+		"transfer": transferView{
+			c.MaxDownloadKBps, c.MaxUploadKBps, c.AltDownloadKBps, c.AltUploadKBps, c.AltSchedule,
+			c.MaxActiveDownloads, c.MaxActiveSeeds, c.MaxConnections,
+		},
 		"notifyURL":       c.NotifyURL,
 		"passwordSet":     live.Password != "",
 		"passwordFromEnv": config.FromEnv("password"),
@@ -741,9 +762,10 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		Indexers []indexerView `json:"indexers"`
 		Quality  qualityView   `json:"quality"`
 		// nil leaves these as they are.
-		SeedRatio *float64 `json:"seedRatio"`
-		MinFreeGB *float64 `json:"minFreeGB"`
-		NotifyURL *string  `json:"notifyURL"`
+		SeedRatio *float64      `json:"seedRatio"`
+		MinFreeGB *float64      `json:"minFreeGB"`
+		NotifyURL *string       `json:"notifyURL"`
+		Transfer  *transferView `json:"transfer"`
 		// nil leaves the password as it is; "" removes it.
 		Password *string `json:"password"`
 	}
@@ -775,6 +797,11 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.NotifyURL != nil {
 			c.NotifyURL = *req.NotifyURL
+		}
+		if t := req.Transfer; t != nil {
+			c.MaxDownloadKBps, c.MaxUploadKBps = t.MaxDownloadKBps, t.MaxUploadKBps
+			c.AltDownloadKBps, c.AltUploadKBps, c.AltSchedule = t.AltDownloadKBps, t.AltUploadKBps, strings.TrimSpace(t.AltSchedule)
+			c.MaxActiveDownloads, c.MaxActiveSeeds, c.MaxConnections = t.MaxActiveDownloads, t.MaxActiveSeeds, t.MaxConnections
 		}
 		if req.Password != nil {
 			c.Password = *req.Password
@@ -885,4 +912,19 @@ func measureFolders(ctx context.Context, c *config.Config) ([]folderView, error)
 		out = append(out, f)
 	}
 	return out, nil
+}
+
+// debugPeers is the torrent client's own report on every torrent and peer,
+// as plain text: for telling a dead swarm from a problem in unified.
+func (s *server) debugPeers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprint(w, `Each peer's "flags: A:B:C" (on its reqq line):
+  A is us:   i = we want data from them, c = we choke them
+  B is how:  U = uTP (else TCP), E/e = encrypted
+  C is them: i = they want data from us, c = they choke us, so they send nothing
+"last helpful" is when they last sent us useful data.
+
+`)
+	s.run.eng.WriteStatus(w)
 }

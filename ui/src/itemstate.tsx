@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import type { Item, Progress } from './api'
-import { ProgressBar, StateBadge } from './components'
+import { ProgressBar, StateBadge, stuckReason } from './components'
 import { airDate, rate, timeLeft } from './format'
 
 const time = (iso: string) => new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
@@ -13,6 +13,13 @@ const time = (iso: string) => new Date(iso).toLocaleTimeString('en-GB', { hour: 
 export function ItemStatus({ item, download: p }: { item: Item; download?: Progress }) {
   if (item.state === 'wanted') return <WantedStatus item={item} />
   if (item.state !== 'downloading' || !p) return <StateBadge state={item.state} />
+  if (p.position) {
+    return (
+      <Status title={p.name} badge={<StateBadge state="queued" label={`Queued #${p.position}`} />}>
+        Starts when a download slot frees up
+      </Status>
+    )
+  }
   if (!p.hasInfo) {
     return (
       <Status title={p.name} badge={<StateBadge state="searching" label="Finding peers…" />}>
@@ -27,7 +34,7 @@ export function ItemStatus({ item, download: p }: { item: Item; download?: Progr
       </Status>
     )
   }
-  const detail = [rate(p.rate), timeLeft(p.done, p.total, p.rate)].filter(Boolean).join(' · ')
+  const detail = stuckReason(p) ?? [rate(p.rate), timeLeft(p.done, p.total, p.rate)].filter(Boolean).join(' · ')
   return (
     <Status title={p.name} badge={<StateBadge state="downloading" label={`Downloading ${Math.floor(p.percent)}%`} />}>
       <ProgressBar percent={p.percent} />
