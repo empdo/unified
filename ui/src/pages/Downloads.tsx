@@ -1,7 +1,7 @@
 import { api } from '../api'
-import { Busy, Notice, ProgressBar, Spinner, StateBadge, progressText, stuckReason } from '../components'
+import { Busy, Notice, ProgressBar, RatioRing, Spinner, StateBadge, progressText, stuckReason } from '../components'
 import { bytes, plural, rate } from '../format'
-import { useAction } from '../hooks'
+import { useAction, useData } from '../hooks'
 import { href } from '../router'
 import { useStatus } from '../status'
 
@@ -95,7 +95,8 @@ export default function Downloads() {
           </p>
           <ul className="list">
             {s.seeding.map((p) => (
-              <li key={p.id}>
+              <li key={p.id} className="seed">
+                <RatioRing ratio={p.ratio} target={status.seedRatio} paused={p.paused || !p.hasInfo} />
                 <a href={href(`/media/${p.mediaId}`)} className="release-name">
                   {p.name}
                 </a>
@@ -119,6 +120,8 @@ export default function Downloads() {
         </section>
       )}
 
+      <Retired />
+
       {status.recent.length > 0 && (
         <section>
           <h2>Recent</h2>
@@ -140,6 +143,48 @@ export default function Downloads() {
         </section>
       )}
     </>
+  )
+}
+
+/** Seeds that reached the seed ratio lately. Those that did in the last minutes get a stamp. */
+function Retired() {
+  const retired = useData(() => api.history({ events: 'seeded', limit: 5 }), [], 15000)
+  const events = retired.data?.events ?? []
+  if (events.length === 0) return null
+  return (
+    <section>
+      <h2>Retired</h2>
+      <p className="muted small">Reached the seed ratio and stopped seeding. Their files stay in the library.</p>
+      <ul className="list">
+        {events.map((e) => {
+          const fresh = Date.now() - Date.parse(e.at) < 10 * 60 * 1000
+          // The detail reads "<release>: uploaded 4.20 GB, ratio 1.00".
+          const [name, result] = (e.detail ?? '').split(/: (?=uploaded)/)
+          const when = new Date(e.at).toLocaleString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+          return (
+            <li key={e.id} className={fresh ? 'seed seed-retired-now' : 'seed'}>
+              <RatioRing ratio={1} target={1} done />
+              <span className="seed-what">
+                {e.inLibrary && e.mediaId ? (
+                  <a href={href(`/media/${e.mediaId}`)} className="release-name">
+                    {name || e.title}
+                  </a>
+                ) : (
+                  <span className="release-name">{name || e.title}</span>
+                )}
+                {fresh && <span className="stamp">Retired</span>}
+              </span>
+              <span className="small muted nowrap">{[result, when].filter(Boolean).join(' · ')}</span>
+            </li>
+          )
+        })}
+      </ul>
+    </section>
   )
 }
 

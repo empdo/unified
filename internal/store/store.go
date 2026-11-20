@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS history (
 	detail   TEXT NOT NULL DEFAULT ''  -- the release, file or reason
 );
 CREATE INDEX IF NOT EXISTS history_media ON history (media_id, id);
+CREATE INDEX IF NOT EXISTS history_event ON history (event, at);
 -- Running totals, such as the bytes downloaded and uploaded over all runs.
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 -- Watchlists and lists whose movies and shows are added to the library.

@@ -72,7 +72,7 @@ export default function App() {
           <a className="brand" href={href('/')}>
             unified
           </a>
-          <span className="dateline">{today()} · TV &amp; film</span>
+          <Dateline downloading={active} />
           <SearchBox key={route.params.get('q') ?? ''} query={section === 'add' ? (route.params.get('q') ?? '') : ''} />
         </div>
         <nav className="tabs">
@@ -242,6 +242,29 @@ function rank(title: string, needle: string) {
 }
 
 const today = () => new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })
+
+/** Today's date and today's news: what arrived, and what is on its way. */
+function Dateline({ downloading }: { downloading: number }) {
+  const arrived = useStatus()?.arrivedToday ?? 0
+  return (
+    <span className="dateline">
+      {today()}
+      {arrived > 0 && (
+        <>
+          {' · '}
+          <a href={href('/history?show=downloads')}>{arrived} arrived today</a>
+        </>
+      )}
+      {downloading > 0 && (
+        <>
+          {' · '}
+          <a href={href('/downloads')}>{downloading} downloading</a>
+        </>
+      )}
+      {arrived === 0 && downloading === 0 && ' · TV & film'}
+    </span>
+  )
+}
 
 /** Download and upload speeds while anything moves; nothing when idle. */
 function TransferRates() {

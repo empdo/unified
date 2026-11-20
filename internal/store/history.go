@@ -35,6 +35,34 @@ func (s *Store) AddEvent(event string, mediaID int64, title, detail string) erro
 	return err
 }
 
+// CountEvents counts the events of a kind since a time.
+func (s *Store) CountEvents(event string, since time.Time) int {
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM history WHERE event = ? AND at >= ?`, event, since.Format(time.RFC3339)).Scan(&n)
+	return n
+}
+
+// LastEvents returns when each movie or show last had an event of a kind,
+// for those that had one since a time.
+func (s *Store) LastEvents(event string, since time.Time) (map[int64]time.Time, error) {
+	rows, err := s.db.Query(`SELECT media_id, MAX(at) FROM history WHERE event = ? AND at >= ? GROUP BY media_id`,
+		event, since.Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]time.Time{}
+	for rows.Next() {
+		var id int64
+		var at string
+		if err := rows.Scan(&id, &at); err != nil {
+			return nil, err
+		}
+		out[id], _ = time.Parse(time.RFC3339, at)
+	}
+	return out, rows.Err()
+}
+
 // HistoryQuery selects events, newest first.
 type HistoryQuery struct {
 	MediaID int64    // 0: about anything

@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func open(t *testing.T) *Store {
 	st, err := Open(t.TempDir())
@@ -91,5 +94,19 @@ func TestListSeen(t *testing.T) {
 	st.RemoveList(id)
 	if st.Seen(id, "movie", 7) {
 		t.Error("seen entries outlived their list")
+	}
+}
+
+func TestLastEvents(t *testing.T) {
+	st := open(t)
+	st.AddEvent(EventImported, 1, "Film", "")
+	st.AddEvent(EventImported, 1, "Film", "")
+	st.AddEvent(EventGrabbed, 2, "Other", "")
+	got, err := st.LastEvents(EventImported, time.Now().Add(-time.Hour))
+	if err != nil || len(got) != 1 || got[1].IsZero() {
+		t.Errorf("got %v, %v", got, err)
+	}
+	if got, _ := st.LastEvents(EventImported, time.Now().Add(time.Hour)); len(got) != 0 {
+		t.Errorf("events from the future: %v", got)
 	}
 }

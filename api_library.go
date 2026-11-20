@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,52 @@ func (s *server) history(w http.ResponseWriter, r *http.Request) {
 		out = append(out, eventView{e, inLibrary[e.MediaID]})
 	}
 	writeJSON(w, map[string]any{"events": out, "more": more})
+}
+
+// frontPage returns the movies and shows that arrived most recently, newest
+// first, each with what of it arrived: the stories of the library's front
+// page.
+func (s *server) frontPage(w http.ResponseWriter, r *http.Request) {
+	events, err := s.st.History(store.HistoryQuery{Events: []string{store.EventImported}, Limit: 300})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	type story struct {
+		mediaView
+		At time.Time `json:"at"` // when the newest of it arrived
+		// What arrived, newest first, as the history names it; for a show,
+		// the episodes that arrived within a week of the newest.
+		Arrived []string `json:"arrived"`
+	}
+	stories := []*story{}
+	byMedia := map[int64]*story{}
+	for _, e := range events {
+		if st, ok := byMedia[e.MediaID]; ok {
+			if st.At.Sub(e.At) < 7*24*time.Hour && !slices.Contains(st.Arrived, e.Title) {
+				st.Arrived = append(st.Arrived, e.Title)
+			}
+			continue
+		}
+		if len(stories) == 4 {
+			continue
+		}
+		m, err := s.st.Media(e.MediaID)
+		if err != nil {
+			continue // no longer in the library
+		}
+		items, err := s.st.Items(m.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		v := newMediaView(m, items)
+		v.Overview, v.Poster = m.Overview, tmdb.ImageURL(m.Poster, "w500")
+		st := &story{mediaView: v, At: e.At, Arrived: []string{e.Title}}
+		byMedia[m.ID] = st
+		stories = append(stories, st)
+	}
+	writeJSON(w, stories)
 }
 
 // Scanning the library folders.

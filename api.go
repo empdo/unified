@@ -109,6 +109,7 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("GET /api/storage", s.storage)
 	api.HandleFunc("GET /api/debug/peers", s.debugPeers)
 	api.HandleFunc("GET /api/history", s.history)
+	api.HandleFunc("GET /api/frontpage", s.frontPage)
 	api.HandleFunc("POST /api/scan", s.scan)
 	api.HandleFunc("POST /api/scan/import", s.scanImport)
 	api.HandleFunc("GET /api/discover", s.discover)
@@ -224,7 +225,14 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		"tmdb":      s.conf.Get().TMDBKey != "",
 		"indexers":  len(s.conf.Get().Indexers),
 		"seedRatio": s.conf.Get().SeedRatio,
+		// Movies and episodes imported since midnight, for the dateline.
+		"arrivedToday": s.st.CountEvents(store.EventImported, midnight(time.Now())),
 	})
+}
+
+func midnight(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
 }
 
 func (s *server) searchNow(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +260,12 @@ type mediaView struct {
 	Poster   string         `json:"poster"` // full image URL, "" when unknown
 	Overview string         `json:"overview,omitempty"`
 	Counts   map[string]int `json:"counts"` // items per state
+	// When something of it was last imported, if within newFor.
+	ArrivedAt time.Time `json:"arrivedAt,omitzero"`
 }
+
+// How long a movie or show counts as new after something of it arrived.
+const newFor = 7 * 24 * time.Hour
 
 func newMediaView(m store.Media, items []store.Item) mediaView {
 	v := mediaView{
@@ -271,6 +284,11 @@ func (s *server) library(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	arrived, err := s.st.LastEvents(store.EventImported, time.Now().Add(-newFor))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	out := []mediaView{}
 	for i := len(media) - 1; i >= 0; i-- {
 		items, err := s.st.Items(media[i].ID)
@@ -278,7 +296,9 @@ func (s *server) library(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		out = append(out, newMediaView(media[i], items))
+		v := newMediaView(media[i], items)
+		v.ArrivedAt = arrived[media[i].ID]
+		out = append(out, v)
 	}
 	writeJSON(w, out)
 }

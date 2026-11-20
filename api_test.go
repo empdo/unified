@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"unified/internal/config"
 	"unified/internal/store"
@@ -258,5 +259,33 @@ func TestHistoryAndLists(t *testing.T) {
 	}
 	if w := do(h, "GET", "/api/lists", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"lists":[]`) {
 		t.Errorf("lists: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestFrontPage(t *testing.T) {
+	s, h := newTestServer(t, "")
+	show, _ := s.st.AddMedia(store.Media{Kind: "show", TMDBID: 1, Title: "Show", Year: 2020})
+	film, _ := s.st.AddMedia(store.Media{Kind: "movie", TMDBID: 2, Title: "Film", Year: 2021})
+	s.st.AddEvent(store.EventImported, show, "Show S01E01", "")
+	s.st.AddEvent(store.EventImported, film, "Film (2021)", "")
+	s.st.AddEvent(store.EventImported, show, "Show S01E02", "")
+	s.st.AddEvent(store.EventImported, 99, "Gone (2000)", "") // removed since
+
+	w := do(h, "GET", "/api/frontpage", "", "")
+	var stories []struct {
+		ID      int64    `json:"id"`
+		Arrived []string `json:"arrived"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &stories); err != nil {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if len(stories) != 2 || stories[0].ID != show || stories[1].ID != film {
+		t.Fatalf("stories: %+v", stories)
+	}
+	if a := stories[0].Arrived; len(a) != 2 || a[0] != "Show S01E02" || a[1] != "Show S01E01" {
+		t.Errorf("arrived: %v", a)
+	}
+	if n := s.st.CountEvents(store.EventImported, midnight(time.Now())); n != 4 {
+		t.Errorf("arrived today: %d", n)
 	}
 }

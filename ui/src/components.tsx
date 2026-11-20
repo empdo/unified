@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import type { Progress } from './api'
 import { bytes, plural, rate, stateLabel } from './format'
 
-export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'xs' | 'sm' | 'md' | 'lg' }) {
+export function Poster({ src, title, size = 'md' }: { src: string; title: string; size?: 'xs' | 'sm' | 'md' | 'lg' | 'lead' }) {
   const [failed, setFailed] = useState(false)
   if (!src || failed) {
     return (
@@ -101,5 +101,41 @@ export function Spinner({ label }: { label: string }) {
       <span className="spinner" aria-hidden="true" />
       {label}
     </div>
+  )
+}
+
+/**
+ * A seed's ratio as a ring filling towards the seed ratio where it stops
+ * (towards 1 with no limit). Done rings are full and show a check.
+ */
+export function RatioRing({ ratio, target, paused, done }: { ratio: number; target: number; paused?: boolean; done?: boolean }) {
+  const r = 16
+  const c = 2 * Math.PI * r
+  const share = done ? 1 : Math.min(ratio / (target > 0 ? target : 1), 1)
+  const label = done
+    ? 'Done seeding'
+    : target > 0
+      ? `Ratio ${ratio.toFixed(2)} of ${target}`
+      : `Ratio ${ratio.toFixed(2)}, no limit`
+  return (
+    <svg className={`ring${paused ? ' ring-paused' : ''}${done ? ' ring-done' : ''}`} viewBox="0 0 40 40" role="img" aria-label={label}>
+      <title>{label}</title>
+      <circle className="ring-track" cx="20" cy="20" r={r} />
+      <circle
+        className="ring-fill"
+        cx="20"
+        cy="20"
+        r={r}
+        strokeDasharray={`${share * c} ${c}`}
+        transform="rotate(-90 20 20)"
+      />
+      {done ? (
+        <path className="ring-check" d="M13 20.5l4.5 4.5L27 15.5" />
+      ) : (
+        <text x="20" y="20" className="ring-text" textAnchor="middle" dominantBaseline="central">
+          {ratio >= 10 ? Math.round(ratio) : ratio.toFixed(ratio >= 1 ? 1 : 2).replace(/^0/, '')}
+        </text>
+      )}
+    </svg>
   )
 }

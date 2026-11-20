@@ -199,6 +199,16 @@ export interface StatusResponse {
   tmdb: boolean
   indexers: number
   seedRatio: number
+  /** Movies and episodes imported since midnight. */
+  arrivedToday: number
+}
+
+/** A movie or show that arrived recently, for the library's front page. */
+export interface FrontStory extends MediaSummary {
+  /** When the newest of it arrived. */
+  at: string
+  /** What arrived, newest first, as the history names it ("Severance S02E03 - Who Is Alive?"). */
+  arrived: string[]
 }
 
 export interface MediaSummary {
@@ -210,6 +220,8 @@ export interface MediaSummary {
   poster: string
   overview?: string
   counts: Partial<Record<ItemState, number>>
+  /** When something of it was last imported, if within the last week. */
+  arrivedAt?: string
 }
 
 export interface Item {
@@ -383,6 +395,7 @@ export const api = {
   testIndexer: (ix: Indexer) => request<{ ok: boolean; error?: string }>('POST', 'api/indexers/test', ix),
   storage: (fresh = false) => request<StorageReport>('GET', `api/storage${fresh ? '?fresh=1' : ''}`),
   testNotify: (url: string) => request<{ ok: boolean; error?: string }>('POST', 'api/notify/test', { url }),
+  frontPage: () => request<FrontStory[]>('GET', 'api/frontpage'),
   history: (p: { media?: number; before?: number; events?: string; limit?: number }) =>
     request<{ events: HistoryEvent[]; more: boolean }>('GET', `api/history?${q(p)}`),
   /** Lists what the movie and TV folders hold, with TMDB matches; adds nothing. */
