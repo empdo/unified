@@ -237,6 +237,30 @@ func (e *Engine) Add(source string) (*torrent.Torrent, error) {
 	return e.client.AddTorrentFromFile(source)
 }
 
+// Totals is the torrent data downloaded and uploaded since the client
+// started, over all torrents, including those dropped since.
+func (e *Engine) Totals() (down, up int64) {
+	st := e.client.Stats()
+	return st.BytesReadUsefulData.Int64(), st.BytesWrittenData.Int64()
+}
+
+// SaveMetainfo writes a torrent's metadata to a .torrent file and returns its
+// path, so a torrent added from a magnet can be added again later without
+// fetching its metadata from peers.
+func (e *Engine) SaveMetainfo(t *torrent.Torrent) (string, error) {
+	mi := t.Metainfo()
+	path := filepath.Join(e.torrentDir, t.InfoHash().HexString()+".torrent")
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	if err := mi.Write(f); err != nil {
+		f.Close()
+		return "", err
+	}
+	return path, f.Close()
+}
+
 // HasInfo reports whether the torrent's metadata (name, file list) is known yet.
 func HasInfo(t *torrent.Torrent) bool {
 	select {

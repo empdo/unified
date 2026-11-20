@@ -127,6 +127,87 @@ func (c *Client) Details(kind string, id int) (Result, error) {
 	return r.toResult(), nil
 }
 
+// Browse lists, which Browse takes.
+const (
+	Trending = "trending" // most watched this week
+	Popular  = "popular"
+	TopRated = "top_rated"
+	Upcoming = "upcoming" // movies soon in cinemas, shows airing now
+)
+
+// Browse returns a page (from 1) of one of TMDB's lists of movies or shows,
+// and how many pages the list has.
+func (c *Client) Browse(kind, list string, page int) ([]Result, int, error) {
+	tmdbKind := "movie"
+	if kind == "show" {
+		tmdbKind = "tv"
+	}
+	var path string
+	switch list {
+	case Trending:
+		path = "/trending/" + tmdbKind + "/week"
+	case Popular, TopRated:
+		path = "/" + tmdbKind + "/" + list
+	case Upcoming:
+		path = "/movie/upcoming"
+		if kind == "show" {
+			path = "/tv/on_the_air"
+		}
+	default:
+		return nil, 0, fmt.Errorf("no such list %q", list)
+	}
+	var body struct {
+		Results    []result `json:"results"`
+		TotalPages int      `json:"total_pages"`
+	}
+	if err := c.get(path, url.Values{"page": {strconv.Itoa(max(page, 1))}}, &body); err != nil {
+		return nil, 0, err
+	}
+	var out []Result
+	for _, r := range body.Results {
+		out = append(out, r.toResult())
+	}
+	return out, body.TotalPages, nil
+}
+
+// ListEntry is a movie or show on a TMDB list.
+type ListEntry struct {
+	Kind string // "movie" or "show"
+	Result
+}
+
+// List returns the name and entries of a public TMDB list, by its id (the
+// number in https://www.themoviedb.org/list/<id>).
+func (c *Client) List(id string) (name string, entries []ListEntry, err error) {
+	for page := 1; ; page++ {
+		var body struct {
+			Name  string `json:"name"`
+			Items []struct {
+				MediaType string `json:"media_type"`
+				result
+			} `json:"items"`
+			TotalPages int `json:"total_pages"`
+		}
+		if err := c.get("/list/"+url.PathEscape(id), url.Values{"page": {strconv.Itoa(page)}}, &body); err != nil {
+			return "", nil, err
+		}
+		name = body.Name
+		for _, it := range body.Items {
+			switch it.MediaType {
+			case "movie":
+				entries = append(entries, ListEntry{"movie", it.toResult()})
+			case "tv":
+				entries = append(entries, ListEntry{"show", it.toResult()})
+			}
+		}
+		// Lists are at most a few thousand entries; the cap guards against
+		// a server that never stops paging.
+		if page >= body.TotalPages || page >= 100 {
+			return name, entries, nil
+		}
+	}
+}
+
 // TVDBID returns the TheTVDB id of a show, or 0 when TMDB does not know it.
 func (c *Client) TVDBID(showID int) (int, error) {
 	var ids struct {

@@ -7,6 +7,7 @@ const RESOLUTIONS = ['2160p', '1080p', '720p', '576p', '480p']
 
 interface Form {
   tmdbKey: string
+  traktClientId: string
   indexers: Indexer[]
   quality: Quality
   seedRatio: number
@@ -19,6 +20,7 @@ interface Form {
 
 const toForm = (s: Settings): Form => ({
   tmdbKey: s.tmdbKey,
+  traktClientId: s.traktClientId,
   indexers: s.indexers,
   quality: s.quality,
   seedRatio: s.seedRatio,
@@ -56,6 +58,7 @@ export default function SettingsPage() {
     const ok = await save.run(() =>
       api.saveSettings({
         tmdbKey: form.tmdbKey.trim(),
+        traktClientId: form.traktClientId.trim(),
         indexers: form.indexers.map((ix) => ({ name: ix.name.trim(), url: ix.url.trim(), apiKey: ix.apiKey.trim() })),
         quality: form.quality,
         seedRatio: form.seedRatio,
@@ -98,6 +101,25 @@ export default function SettingsPage() {
       <Section title="Metadata" hint="Titles, episode lists and posters come from TMDB.">
         <Field label="TMDB API key" help="Free from themoviedb.org → Settings → API." group>
           <SecretInput label="TMDB API key" value={form.tmdbKey} onChange={(v) => update({ tmdbKey: v })} />
+        </Field>
+        <Field
+          label="Trakt client ID"
+          help={
+            <>
+              Only for importing Trakt watchlists and lists on the Discover page. Create a free API app at{' '}
+              <a href="https://trakt.tv/oauth/applications/new" target="_blank" rel="noreferrer">
+                trakt.tv/oauth/applications
+              </a>{' '}
+              (any redirect URI works, e.g. urn:ietf:wg:oauth:2.0:oob) and paste its Client ID.
+            </>
+          }
+          group
+        >
+          <SecretInput
+            label="Trakt client ID"
+            value={form.traktClientId}
+            onChange={(v) => update({ traktClientId: v })}
+          />
         </Field>
       </Section>
 
@@ -325,7 +347,7 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
 
 /** A labelled control. Use group for several controls, since a <label>
  * forwards clicks on its text to the first control inside it. */
-function Field(props: { label: string; help?: string; group?: boolean; children: ReactNode }) {
+function Field(props: { label: string; help?: ReactNode; group?: boolean; children: ReactNode }) {
   const { label, help, group, children } = props
   const body = (
     <>

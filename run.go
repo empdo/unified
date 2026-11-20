@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -39,6 +40,9 @@ const (
 	// episodes that have aired since) are searched again this often.
 	retryInterval = 30 * time.Minute
 	logLines      = 100
+	// How often the bytes downloaded and uploaded are saved, so a crash
+	// loses little of the totals and seed ratios.
+	saveInterval = time.Minute
 )
 
 type activeDownload struct {
@@ -57,9 +61,48 @@ type activeDownload struct {
 	rate     float64
 	// The connection limit last set, -1 before the first.
 	maxConns int
+	// For the upload rate shown in the UI.
+	upDone int64
+	upAt   time.Time
+	upRate float64
 	// For seeding: since when, and whether it waits for a seeding slot.
 	seedSince time.Time
 	paused    bool
+	// Bytes downloaded and uploaded in earlier runs, before the torrent was
+	// added this time; the torrent's own counts start from 0.
+	downBefore, upBefore int64
+	// A seed added back after a restart, whose files are yet to be checked.
+	resumed bool
+}
+
+// transferred is the torrent data the download has downloaded and uploaded,
+// over all runs.
+func (a *activeDownload) transferred() (down, up int64) {
+	st := a.t.Stats()
+	return a.downBefore + st.BytesReadUsefulData.Int64(), a.upBefore + st.BytesWrittenData.Int64()
+}
+
+// ratio is the data uploaded, over all runs, as a multiple of its size.
+func (a *activeDownload) ratio() float64 {
+	if !engine.HasInfo(a.t) || a.t.Length() == 0 {
+		return 0
+	}
+	_, up := a.transferred()
+	return float64(up) / float64(a.t.Length())
+}
+
+// measureUpload returns the upload rate, in bytes per second, updating it
+// every couple of seconds.
+func (a *activeDownload) measureUpload(now time.Time) float64 {
+	st := a.t.Stats()
+	up := st.BytesWrittenData.Int64()
+	if el := now.Sub(a.upAt).Seconds(); el >= 2 {
+		if !a.upAt.IsZero() {
+			a.upRate = float64(up-a.upDone) / el
+		}
+		a.upDone, a.upAt = up, now
+	}
+	return a.upRate
 }
 
 // Progress is a snapshot of one active download, for the web UI.
@@ -74,8 +117,8 @@ type Progress struct {
 	Total   int64   `json:"total"`
 	Peers   int     `json:"peers"`
 	Rate    float64 `json:"rate"` // bytes per second
-	// For seeding downloads: bytes uploaded since unified started, and that
-	// as a multiple of the size.
+	UpRate  float64 `json:"upRate"`
+	// Bytes uploaded over all runs, and that as a multiple of the size.
 	Uploaded int64   `json:"uploaded"`
 	Ratio    float64 `json:"ratio"`
 	// Peer connections over uTP and TCP.
@@ -135,6 +178,26 @@ type runner struct {
 	// being searched for right now.
 	searches  map[int64]ItemSearch
 	searching *SearchView
+	transfer  TransferStatus
+
+	// The engine's totals when last measured and last saved, and the totals
+	// of earlier runs. Only the loop goroutine uses these.
+	measured, saved     [2]int64
+	measuredAt, savedAt time.Time
+	before              [2]int64
+}
+
+// TransferStatus is how much torrent data has been moved, and how fast it
+// moves now.
+type TransferStatus struct {
+	// Over all runs, and since unified started.
+	Downloaded        int64 `json:"downloaded"`
+	Uploaded          int64 `json:"uploaded"`
+	SessionDownloaded int64 `json:"sessionDownloaded"`
+	SessionUploaded   int64 `json:"sessionUploaded"`
+	// Bytes per second, over all torrents.
+	DownRate float64 `json:"downRate"`
+	UpRate   float64 `json:"upRate"`
 }
 
 // ItemSearch is where the search for a wanted item stands.
@@ -158,15 +221,16 @@ type SearchStatus struct {
 
 // Status is what the web UI shows about the runner.
 type Status struct {
-	Active  []Progress   `json:"active"`
-	Seeding []Progress   `json:"seeding"`
-	Log     []string     `json:"log"` // newest first
-	VPN     string       `json:"vpn"`
-	VPNErr  string       `json:"vpnError"`
-	Disk    DiskStatus   `json:"disk"`
-	Search  SearchStatus `json:"search"`
-	Queued  []Progress   `json:"queued"` // downloads waiting for a slot, in order
-	Limits  LimitStatus  `json:"limits"`
+	Active   []Progress     `json:"active"`
+	Seeding  []Progress     `json:"seeding"`
+	Log      []string       `json:"log"` // newest first
+	VPN      string         `json:"vpn"`
+	VPNErr   string         `json:"vpnError"`
+	Disk     DiskStatus     `json:"disk"`
+	Search   SearchStatus   `json:"search"`
+	Queued   []Progress     `json:"queued"` // downloads waiting for a slot, in order
+	Limits   LimitStatus    `json:"limits"`
+	Transfer TransferStatus `json:"transfer"`
 }
 
 // DiskStatus is the free space for downloads and the library.
@@ -343,6 +407,9 @@ func (r *runner) remove(req removeRequest) error {
 		if a.mediaID == req.media {
 			stop(a)
 			delete(r.seeding, id)
+			if err := r.st.SetSeeding(id, false); err != nil {
+				return err
+			}
 		}
 	}
 	for _, q := range r.unqueue(func(q queuedDownload) bool { return q.mediaID == req.media }) {
@@ -377,9 +444,11 @@ func (r *runner) remove(req removeRequest) error {
 			return deleteErr
 		}
 		r.logf("deleted the files of %s", m.Title)
+		r.record(store.EventDeleted, m.ID, describe(m, nil), fmt.Sprintf("%d files", len(library)))
 	}
 	if req.fromLibrary {
 		r.logf("removed %s from the library", m.Title)
+		r.record(store.EventRemoved, m.ID, describe(m, nil), "")
 		return r.st.RemoveMedia(m.ID)
 	}
 	return nil
@@ -461,6 +530,9 @@ func (r *runner) removeItems(req removeRequest) error {
 			}
 			a.t.Drop()
 			delete(r.seeding, id)
+			if err := r.st.SetSeeding(id, false); err != nil {
+				return err
+			}
 		}
 	}
 	defer r.publish()
@@ -493,6 +565,7 @@ func (r *runner) removeItems(req removeRequest) error {
 			return deleteErr
 		}
 		r.logf("cancelled the downloads of %s", describe(m, items))
+		r.record(store.EventCancelled, m.ID, describe(m, items), "")
 		return nil
 	}
 	deleteErr := importer.Delete(r.cfg(), library, downloaded)
@@ -505,6 +578,7 @@ func (r *runner) removeItems(req removeRequest) error {
 		return deleteErr
 	}
 	r.logf("deleted the files of %s", describe(m, items))
+	r.record(store.EventDeleted, m.ID, describe(m, items), fmt.Sprintf("%d files", len(library)))
 	return nil
 }
 
@@ -525,7 +599,7 @@ func (r *runner) Snapshot() Status {
 		Active: append([]Progress(nil), r.snapshot...), Seeding: append([]Progress(nil), r.seeds...),
 		Queued: append([]Progress(nil), r.queued...), Limits: r.limits,
 		Log: lines, VPN: r.vpn, VPNErr: r.vpnErr, Disk: r.disk,
-		Search: SearchStatus{Current: r.searching, Queued: queued},
+		Search: SearchStatus{Current: r.searching, Queued: queued}, Transfer: r.transfer,
 	}
 }
 
@@ -662,7 +736,10 @@ func (r *runner) logf(format string, args ...any) {
 // loop runs until ctx is cancelled, or with keepRunning false, until nothing
 // is left to download.
 func (r *runner) loop(keepRunning bool) error {
-	if err := r.resume(); err != nil {
+	r.before = [2]int64{r.st.Counter(store.TotalDownloaded), r.st.Counter(store.TotalUploaded)}
+	r.measureTransfer()
+	defer r.saveTransfers()
+	if err := r.resume(keepRunning); err != nil {
 		return err
 	}
 	r.refreshScenes()
@@ -676,6 +753,7 @@ func (r *runner) loop(keepRunning bool) error {
 		up := r.checkVPN()
 		r.checkDisk()
 		r.applyRateLimits()
+		r.measureTransfer()
 		if pending && up {
 			if err := r.grabWanted(); err != nil {
 				return err
@@ -706,7 +784,9 @@ func (r *runner) loop(keepRunning bool) error {
 					return err
 				}
 			} else {
-				r.unqueue(func(q queuedDownload) bool { return q.dl.ID == id })
+				for _, q := range r.unqueue(func(q queuedDownload) bool { return q.dl.ID == id }) {
+					r.recordDownload(store.EventFailed, q.dl.ID, q.dl.Name+": marked as failed")
+				}
 				if err := r.st.FailDownload(id); err != nil {
 					return err
 				}
@@ -751,6 +831,7 @@ func (r *runner) grabByHand(g grabRequest, up bool) {
 	dl, err := r.start(g.items, g.title, g.link, 0)
 	if err == nil {
 		r.logf("grabbed [%d] %s (chosen by hand)", dl.ID, dl.Name)
+		r.recordDownload(store.EventGrabbed, dl.ID, dl.Name+" (chosen by hand)")
 	}
 	g.reply <- err
 }
@@ -793,28 +874,106 @@ func (r *runner) stillWanted(items []store.Item) ([]store.Item, error) {
 
 // stopSeeding removes imported downloads that reached the seed ratio from
 // the client. Their files stay where they are.
+// Seeds whose files are gone, as when they were deleted while unified was
+// not running, are stopped too.
 func (r *runner) stopSeeding() {
 	limit := r.cfg().SeedRatio
-	if limit <= 0 {
-		return
-	}
 	for id, a := range r.seeding {
-		if ratio := seedRatio(a.t); ratio >= limit {
+		if a.resumed && engine.HasInfo(a.t) {
+			a.resumed = false
+			if missing := r.missingFile(a.t); missing != "" {
+				r.logf("[%d] %s is gone, stopped seeding %s", id, missing, a.dl.Name)
+				r.stopSeed(a)
+				continue
+			}
+		}
+		if ratio := a.ratio(); limit > 0 && ratio >= limit {
 			r.logf("[%d] reached seed ratio %.2f, stopped seeding", id, ratio)
-			a.t.Drop()
-			delete(r.seeding, id)
+			_, up := a.transferred()
+			r.record(store.EventSeeded, a.mediaID, r.mediaTitle(a.mediaID, a.dl.Name),
+				fmt.Sprintf("%s: uploaded %s, ratio %.2f", a.dl.Name, engine.Size(up), ratio))
+			r.stopSeed(a)
 		}
 	}
 }
 
-// seedRatio is the data uploaded since the torrent was added, as a multiple
-// of its size.
-func seedRatio(t *torrent.Torrent) float64 {
-	if !engine.HasInfo(t) || t.Length() == 0 {
-		return 0
+// stopSeed removes a seed from the client for good: it is not seeded again
+// after a restart. Its files stay.
+func (r *runner) stopSeed(a *activeDownload) {
+	r.saveDownload(a)
+	a.t.Drop()
+	delete(r.seeding, a.dl.ID)
+	if err := r.st.SetSeeding(a.dl.ID, false); err != nil {
+		r.logf("[%d] %v", a.dl.ID, err)
 	}
-	st := t.Stats()
-	return float64(st.BytesWrittenData.Int64()) / float64(t.Length())
+}
+
+// missingFile returns the first of a torrent's files that is not in the
+// download directory at its full size, or "" when all are.
+func (r *runner) missingFile(t *torrent.Torrent) string {
+	for _, f := range t.Files() {
+		fi, err := os.Stat(filepath.Join(r.cfg().DownloadDir, f.Path()))
+		if err != nil || fi.Size() < f.Length() {
+			return f.Path()
+		}
+	}
+	return ""
+}
+
+// measureTransfer updates the totals and rates of data moved, and saves
+// them every saveInterval.
+func (r *runner) measureTransfer() {
+	if r.eng == nil {
+		return
+	}
+	down, up := r.eng.Totals()
+	now := time.Now()
+	r.mu.Lock()
+	t := r.transfer
+	if el := now.Sub(r.measuredAt).Seconds(); !r.measuredAt.IsZero() && el > 0 {
+		t.DownRate = float64(down-r.measured[0]) / el
+		t.UpRate = float64(up-r.measured[1]) / el
+	}
+	t.SessionDownloaded, t.SessionUploaded = down, up
+	t.Downloaded, t.Uploaded = r.before[0]+down, r.before[1]+up
+	r.transfer = t
+	r.mu.Unlock()
+	r.measured, r.measuredAt = [2]int64{down, up}, now
+	if r.savedAt.IsZero() {
+		r.savedAt = now
+	} else if now.Sub(r.savedAt) >= saveInterval {
+		r.saveTransfers()
+	}
+}
+
+// saveTransfers saves the totals of data moved, and what each download in
+// the client has moved.
+func (r *runner) saveTransfers() {
+	if r.eng == nil {
+		return
+	}
+	down, up := r.eng.Totals()
+	if err := r.st.AddCounters(map[string]int64{
+		store.TotalDownloaded: down - r.saved[0],
+		store.TotalUploaded:   up - r.saved[1],
+	}); err != nil {
+		r.logf("could not save transfer totals: %v", err)
+		return
+	}
+	r.saved, r.savedAt = [2]int64{down, up}, time.Now()
+	for _, a := range r.active {
+		r.saveDownload(a)
+	}
+	for _, a := range r.seeding {
+		r.saveDownload(a)
+	}
+}
+
+func (r *runner) saveDownload(a *activeDownload) {
+	down, up := a.transferred()
+	if err := r.st.SetTransferred(a.dl.ID, down, up); err != nil {
+		r.logf("[%d] could not save what it transferred: %v", a.dl.ID, err)
+	}
 }
 
 func (r *runner) publish() {
@@ -828,6 +987,7 @@ func (r *runner) publish() {
 		p.UTP, p.TCP, _ = engine.Conns(a.t)
 		p.Seeders, p.Known, p.Best = engine.Swarm(a.t)
 		p.Started = a.added
+		p.UpRate = a.measureUpload(now)
 		if engine.HasInfo(a.t) {
 			p.GivesUpAt, _ = giveUpAt(a.progress, a.seedSeen, a.lastDone)
 		}
@@ -856,11 +1016,14 @@ func (r *runner) publish() {
 
 	var seeds []Progress
 	for _, a := range r.seeding {
-		st := a.t.Stats()
+		_, up := a.transferred()
 		p := Progress{
 			ID: a.dl.ID, MediaID: a.mediaID, Name: a.dl.Name, Status: engine.Status(a.t),
-			HasInfo: true, Percent: 100, Done: a.t.Length(), Total: a.t.Length(), Peers: st.ActivePeers,
-			Uploaded: st.BytesWrittenData.Int64(), Ratio: seedRatio(a.t), Paused: a.paused,
+			HasInfo: engine.HasInfo(a.t), Percent: 100, Done: a.t.Length(), Total: a.t.Length(), Peers: a.t.Stats().ActivePeers,
+			Uploaded: up, Ratio: a.ratio(), Paused: a.paused, UpRate: a.measureUpload(now),
+		}
+		if !p.HasInfo {
+			p.Done, p.Total = 0, 0
 		}
 		p.UTP, p.TCP, _ = engine.Conns(a.t)
 		seeds = append(seeds, p)
@@ -874,7 +1037,8 @@ func (r *runner) publish() {
 
 // resume puts the downloads that were unfinished when unified last stopped
 // back in line, oldest first, and starts as many as there are slots for.
-func (r *runner) resume() error {
+// With seed set, finished downloads that were still seeding seed again.
+func (r *runner) resume(seed bool) error {
 	dls, err := r.st.Downloads(true)
 	if err != nil {
 		return err
@@ -883,15 +1047,53 @@ func (r *runner) resume() error {
 		r.logf("resuming %s", dl.Name)
 		r.enqueue(dl, 0)
 	}
+	if seed {
+		if err := r.resumeSeeds(); err != nil {
+			return err
+		}
+	}
 	if !r.checkVPN() {
 		return nil // they start once the VPN is up
 	}
 	return r.fillSlots()
 }
 
+// resumeSeeds adds the downloads that were seeding when unified last
+// stopped back to the client. They keep their place in line for a seeding
+// slot and their seed ratio.
+func (r *runner) resumeSeeds() error {
+	dls, err := r.st.SeedingDownloads()
+	if err != nil {
+		return err
+	}
+	for _, dl := range dls {
+		t, err := r.eng.Add(dl.Source)
+		if err != nil {
+			r.logf("[%d] cannot seed %s again: %v", dl.ID, dl.Name, err)
+			if err := r.st.SetSeeding(dl.ID, false); err != nil {
+				return err
+			}
+			continue
+		}
+		r.seeding[dl.ID] = &activeDownload{
+			dl: dl, mediaID: r.st.DownloadMedia(dl.ID), t: t, added: time.Now(), maxConns: -1,
+			seedSince: cmp.Or(dl.FinishedAt, time.Now()), downBefore: dl.Downloaded, upBefore: dl.Uploaded, resumed: true,
+		}
+	}
+	if len(dls) > 0 {
+		r.logf("seeding %d finished downloads again", len(r.seeding))
+	}
+	r.limitSeeds()
+	r.balanceConns()
+	return nil
+}
+
 func (r *runner) track(dl store.Download, mediaID int64, t *torrent.Torrent) {
 	now := time.Now()
-	r.active[dl.ID] = &activeDownload{dl: dl, mediaID: mediaID, t: t, added: now, progress: now, seedSeen: now, maxConns: -1}
+	r.active[dl.ID] = &activeDownload{
+		dl: dl, mediaID: mediaID, t: t, added: now, progress: now, seedSeen: now, maxConns: -1,
+		downBefore: dl.Downloaded, upBefore: dl.Uploaded,
+	}
 	r.balanceConns()
 	r.publish()
 }
@@ -1075,6 +1277,8 @@ func (r *runner) grab(m store.Media, items []store.Item, w release.Want) (ok boo
 			continue
 		}
 		r.logf("  grabbed [%d] %s (%s, %d seeders)", dl.ID, c.Title, engine.Size(c.Size), c.Seeders)
+		r.record(store.EventGrabbed, m.ID, describe(m, items),
+			fmt.Sprintf("%s (%s, %d seeders, from %s)", c.Title, engine.Size(c.Size), c.Seeders, c.Indexer))
 		return true
 	}
 	if tooBig > 0 {
@@ -1174,6 +1378,8 @@ func giveUpAt(progress, seedSeen time.Time, done int64) (time.Time, string) {
 func (r *runner) fail(a *activeDownload, why string) error {
 	r.logf("[%d] failed (%s), blocklisting and looking for another release", a.dl.ID, why)
 	r.notify("Download failed", fmt.Sprintf("%s failed (%s). Looking for another release.", a.dl.Name, why))
+	r.recordDownload(store.EventFailed, a.dl.ID, a.dl.Name+": "+why)
+	r.saveDownload(a)
 	a.t.Drop()
 	return r.st.FailDownload(a.dl.ID)
 }
@@ -1206,6 +1412,7 @@ func (r *runner) finish(a *activeDownload) error {
 		for _, it := range items {
 			if it.ID == res.ItemID {
 				imported = append(imported, it)
+				r.record(store.EventImported, m.ID, describe(m, []store.Item{it}), res.Dest)
 			}
 		}
 	}
@@ -1225,9 +1432,58 @@ func (r *runner) done(a *activeDownload) error {
 	if err := r.st.FinishDownload(a.dl.ID); err != nil {
 		return err
 	}
+	// Seeding resumes after a restart, which is quicker from the .torrent
+	// file than from a magnet, whose metadata would come from peers again.
+	if strings.HasPrefix(a.dl.Source, "magnet:") {
+		if path, err := r.eng.SaveMetainfo(a.t); err != nil {
+			r.logf("[%d] could not save its .torrent file: %v", a.dl.ID, err)
+		} else if err := r.st.SetSource(a.dl.ID, path); err != nil {
+			return err
+		} else {
+			a.dl.Source = path
+		}
+	}
+	if err := r.st.SetSeeding(a.dl.ID, true); err != nil {
+		return err
+	}
+	r.saveDownload(a)
 	a.seedSince, a.paused = time.Now(), false
 	r.seeding[a.dl.ID] = a
 	return nil
+}
+
+// record adds an event to the history.
+func (r *runner) record(event string, mediaID int64, title, detail string) {
+	if err := r.st.AddEvent(event, mediaID, title, detail); err != nil {
+		r.logf("could not add to the history: %v", err)
+	}
+}
+
+// recordDownload adds an event about a download to the history, naming what
+// it was meant to bring.
+func (r *runner) recordDownload(event string, id int64, detail string) {
+	items, _ := r.st.DownloadItems(id)
+	if len(items) == 0 {
+		mediaID := r.st.DownloadMedia(id)
+		r.record(event, mediaID, r.mediaTitle(mediaID, ""), detail)
+		return
+	}
+	m, err := r.st.Media(items[0].MediaID)
+	if err != nil {
+		r.record(event, 0, "", detail)
+		return
+	}
+	r.record(event, m.ID, describe(m, items), detail)
+}
+
+// mediaTitle names a movie or show for the history, or returns fallback when
+// it is not in the library.
+func (r *runner) mediaTitle(mediaID int64, fallback string) string {
+	m, err := r.st.Media(mediaID)
+	if err != nil {
+		return fallback
+	}
+	return describe(m, nil)
 }
 
 // describe names a movie, or some episodes of a show: "Severance S02E03 -

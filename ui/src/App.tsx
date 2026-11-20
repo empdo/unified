@@ -11,6 +11,10 @@ import ReleasesPage from './pages/Releases'
 import Downloads from './pages/Downloads'
 import StoragePage from './pages/Storage'
 import SettingsPage from './pages/Settings'
+import HistoryPage from './pages/History'
+import ScanPage from './pages/Scan'
+import DiscoverPage from './pages/Discover'
+import { rate } from './format'
 
 export default function App() {
   const route = useRoute()
@@ -40,6 +44,21 @@ export default function App() {
     case 'settings':
       page = <SettingsPage />
       break
+    case 'history':
+      page = (
+        <HistoryPage
+          key={route.params.toString()}
+          filter={route.params.get('show') ?? 'all'}
+          media={Number(route.params.get('media')) || undefined}
+        />
+      )
+      break
+    case 'scan':
+      page = <ScanPage />
+      break
+    case 'discover':
+      page = <DiscoverPage view={route.parts[1] === 'lists' ? 'lists' : 'browse'} params={route.params} />
+      break
     default:
       page = <p className="muted">Page not found.</p>
   }
@@ -57,11 +76,17 @@ export default function App() {
           <SearchBox key={route.params.get('q') ?? ''} query={section === 'add' ? (route.params.get('q') ?? '') : ''} />
         </div>
         <nav className="tabs">
-          <a className={section === undefined || section === 'media' ? 'current' : ''} href={href('/')}>
+          <a className={section === undefined || section === 'media' || section === 'scan' ? 'current' : ''} href={href('/')}>
             Library
+          </a>
+          <a className={section === 'discover' ? 'current' : ''} href={href('/discover')}>
+            Discover
           </a>
           <a className={section === 'downloads' ? 'current' : ''} href={href('/downloads')}>
             Downloads{active > 0 && ` (${active})`}
+          </a>
+          <a className={section === 'history' ? 'current' : ''} href={href('/history')}>
+            History
           </a>
           <a className={section === 'storage' ? 'current' : ''} href={href('/storage')}>
             Storage{lowSpace && <span className="tab-alert"> (low)</span>}
@@ -69,6 +94,7 @@ export default function App() {
           <a className={section === 'settings' ? 'current' : ''} href={href('/settings')}>
             Settings
           </a>
+          <TransferRates />
           <VpnStatus />
         </nav>
       </header>
@@ -216,6 +242,21 @@ function rank(title: string, needle: string) {
 }
 
 const today = () => new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })
+
+/** Download and upload speeds while anything moves; nothing when idle. */
+function TransferRates() {
+  const t = useStatus()?.status.transfer
+  if (!t) return null
+  const down = t.downRate >= 1024
+  const up = t.upRate >= 1024
+  if (!down && !up) return null
+  return (
+    <a className="rates" href={href('/downloads')} title="Downloading and uploading now">
+      {down && <span className="moving-down">↓ {rate(t.downRate)}</span>}
+      {up && <span className="moving-up">↑ {rate(t.upRate)}</span>}
+    </a>
+  )
+}
 
 function VpnStatus() {
   const s = useStatus()?.status

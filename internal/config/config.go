@@ -20,7 +20,10 @@ type Config struct {
 	MoviesDir   string `toml:"movies_dir"`
 	TVDir       string `toml:"tv_dir"`
 	TMDBKey     string `toml:"tmdb_api_key"`
-	ListenPort  int    `toml:"listen_port"`
+	// Client ID of a Trakt API app, needed to import Trakt watchlists and
+	// lists.
+	TraktClientID string `toml:"trakt_client_id"`
+	ListenPort    int    `toml:"listen_port"`
 	// Finished downloads stop seeding once they have uploaded this many times
 	// their size; 0 seeds for as long as unified runs.
 	SeedRatio float64 `toml:"seed_ratio"`
@@ -91,6 +94,11 @@ tv_dir       = "%[2]s/tv"
 # Free key from https://www.themoviedb.org/settings/api
 # (either the "API Key" or the "API Read Access Token" works).
 tmdb_api_key = ""
+
+# Only needed to import Trakt watchlists and lists: the Client ID of an API
+# app, created for free at https://trakt.tv/oauth/applications/new (any
+# redirect URI works, e.g. urn:ietf:wg:oauth:2.0:oob).
+trakt_client_id = ""
 
 listen_port = 42069
 

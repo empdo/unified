@@ -63,6 +63,37 @@ CREATE TABLE IF NOT EXISTS downloads (
 	state    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blocklist (name TEXT PRIMARY KEY);
+-- What happened, kept after the media it was about is removed.
+CREATE TABLE IF NOT EXISTS history (
+	id       INTEGER PRIMARY KEY,
+	at       TEXT NOT NULL,           -- RFC 3339
+	event    TEXT NOT NULL,           -- see the Event constants
+	media_id INTEGER NOT NULL DEFAULT 0,
+	title    TEXT NOT NULL DEFAULT '', -- what it was about: "Severance S02E03"
+	detail   TEXT NOT NULL DEFAULT ''  -- the release, file or reason
+);
+CREATE INDEX IF NOT EXISTS history_media ON history (media_id, id);
+-- Running totals, such as the bytes downloaded and uploaded over all runs.
+CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+-- Watchlists and lists whose movies and shows are added to the library.
+CREATE TABLE IF NOT EXISTS lists (
+	id         INTEGER PRIMARY KEY,
+	kind       TEXT NOT NULL,           -- see the List constants
+	source     TEXT NOT NULL,           -- Trakt user, user/list, or TMDB list id
+	name       TEXT NOT NULL DEFAULT '',
+	want       TEXT NOT NULL,           -- all, first (season) or none
+	synced_at  TEXT NOT NULL DEFAULT '',
+	last_error TEXT NOT NULL DEFAULT '',
+	UNIQUE (kind, source)
+);
+-- Entries of a list already handled, so what is removed from the library
+-- is not added again by the next sync.
+CREATE TABLE IF NOT EXISTS list_seen (
+	list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+	kind    TEXT NOT NULL,
+	tmdb_id INTEGER NOT NULL,
+	PRIMARY KEY (list_id, kind, tmdb_id)
+);
 `
 
 type Media struct {
@@ -108,6 +139,13 @@ type Download struct {
 	Name     string
 	Source   string
 	State    string
+	// Bytes of torrent data downloaded and uploaded, over all runs.
+	Downloaded int64
+	Uploaded   int64
+	// A finished download that still seeds, also after a restart, until it
+	// reaches the seed ratio or is removed.
+	Seeding    bool
+	FinishedAt time.Time
 }
 
 type Store struct{ db *sql.DB }
@@ -139,6 +177,10 @@ func migrate(db *sql.DB) error {
 		{"media", "aliases", `TEXT NOT NULL DEFAULT ''`},
 		{"items", "scene_season", `INTEGER NOT NULL DEFAULT 0`},
 		{"items", "scene_episode", `INTEGER NOT NULL DEFAULT 0`},
+		{"downloads", "downloaded", `INTEGER NOT NULL DEFAULT 0`},
+		{"downloads", "uploaded", `INTEGER NOT NULL DEFAULT 0`},
+		{"downloads", "seeding", `INTEGER NOT NULL DEFAULT 0`},
+		{"downloads", "finished_at", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.col).Scan(&n); err != nil {
@@ -335,11 +377,20 @@ func (s *Store) CreateDownload(infohash, name, source string, itemIDs []int64) (
 }
 
 func (s *Store) Downloads(onlyActive bool) ([]Download, error) {
-	q := `SELECT id, infohash, name, source, state FROM downloads`
 	if onlyActive {
-		q += ` WHERE state = 'downloading'`
+		return s.queryDownloads(`state = 'downloading'`)
 	}
-	rows, err := s.db.Query(q + ` ORDER BY id`)
+	return s.queryDownloads(`1`)
+}
+
+// SeedingDownloads returns the finished downloads that should still seed.
+func (s *Store) SeedingDownloads() ([]Download, error) {
+	return s.queryDownloads(`state = 'done' AND seeding = 1`)
+}
+
+func (s *Store) queryDownloads(where string) ([]Download, error) {
+	rows, err := s.db.Query(`SELECT id, infohash, name, source, state, downloaded, uploaded, seeding, finished_at
+		FROM downloads WHERE ` + where + ` ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -347,12 +398,70 @@ func (s *Store) Downloads(onlyActive bool) ([]Download, error) {
 	var out []Download
 	for rows.Next() {
 		var d Download
-		if err := rows.Scan(&d.ID, &d.InfoHash, &d.Name, &d.Source, &d.State); err != nil {
+		var finished string
+		if err := rows.Scan(&d.ID, &d.InfoHash, &d.Name, &d.Source, &d.State, &d.Downloaded, &d.Uploaded, &d.Seeding, &finished); err != nil {
 			return nil, err
 		}
+		d.FinishedAt, _ = time.Parse(time.RFC3339, finished)
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// SetTransferred records how much a download has downloaded and uploaded
+// over all runs.
+func (s *Store) SetTransferred(id, downloaded, uploaded int64) error {
+	_, err := s.db.Exec(`UPDATE downloads SET downloaded = ?, uploaded = ? WHERE id = ?`, downloaded, uploaded, id)
+	return err
+}
+
+// SetSeeding records whether a finished download still seeds.
+func (s *Store) SetSeeding(id int64, seeding bool) error {
+	_, err := s.db.Exec(`UPDATE downloads SET seeding = ? WHERE id = ?`, seeding, id)
+	return err
+}
+
+// SetSource replaces a download's magnet URI with a saved .torrent file.
+func (s *Store) SetSource(id int64, source string) error {
+	_, err := s.db.Exec(`UPDATE downloads SET source = ? WHERE id = ?`, source, id)
+	return err
+}
+
+// Counter names.
+const (
+	TotalDownloaded = "downloaded"
+	TotalUploaded   = "uploaded"
+)
+
+// AddCounters adds to running totals.
+func (s *Store) AddCounters(add map[string]int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for name, n := range add {
+		if _, err := tx.Exec(`INSERT INTO counters (name, value) VALUES (?, ?)
+			ON CONFLICT (name) DO UPDATE SET value = value + excluded.value`, name, n); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Counter returns a running total, 0 when nothing was added to it.
+func (s *Store) Counter(name string) int64 {
+	var n int64
+	s.db.QueryRow(`SELECT value FROM counters WHERE name = ?`, name).Scan(&n)
+	return n
+}
+
+// DownloadMedia returns the movie or show a download brought files for, 0
+// when none of its items are left.
+func (s *Store) DownloadMedia(downloadID int64) int64 {
+	var id int64
+	s.db.QueryRow(`SELECT media_id FROM items WHERE download_id = ? LIMIT 1`, downloadID).Scan(&id)
+	return id
 }
 
 func (s *Store) HasInfoHash(infohash string) bool {
@@ -369,7 +478,11 @@ func (s *Store) SetImported(itemID int64, path string) error {
 // FinishDownload marks the download done. Items it was meant to provide but
 // that were not imported go back to wanted.
 func (s *Store) FinishDownload(id int64) error {
-	return s.closeDownload(id, Done, false)
+	if err := s.closeDownload(id, Done, false); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE downloads SET finished_at = ? WHERE id = ?`, time.Now().Format(time.RFC3339), id)
+	return err
 }
 
 // CancelDownload stops a download without blocklisting the release.
@@ -415,6 +528,25 @@ func (s *Store) CancelItems(ids []int64) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// ItemPaths returns the library files items have, mapped to their items.
+func (s *Store) ItemPaths() (map[string]int64, error) {
+	rows, err := s.db.Query(`SELECT path, id FROM items WHERE path != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var path string
+		var id int64
+		if err := rows.Scan(&path, &id); err != nil {
+			return nil, err
+		}
+		out[path] = id
+	}
+	return out, rows.Err()
 }
 
 // Item returns one item.

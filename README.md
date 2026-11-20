@@ -17,6 +17,34 @@ The UI has the library with posters, a page per movie or show, search, the
 releases found for anything (Grab downloads one of them yourself, even one
 the ranking rejected), downloads with progress, and settings.
 
+Discover browses TMDB's trending, popular, top rated and upcoming movies and
+shows. Under Discover → Lists, follow a Trakt watchlist, a Trakt list or a
+public TMDB list: what is on it is added to the library, and with the list's
+setting downloaded, now and again every six hours. Something removed from the
+library is not added back by the next sync. Trakt needs `trakt_client_id`, the
+Client ID of a free API app from https://trakt.tv/oauth/applications/new.
+
+History keeps what happened: what was added, grabbed (from which indexer),
+imported, failed and why, deleted and removed, also for movies and shows no
+longer in the library. Each movie or show's page shows its own.
+
+The Downloads page shows how much has been downloaded and uploaded in all,
+and since unified started, and what is moving right now; while anything
+downloads or uploads, its speed is also shown next to the tabs.
+
+### Movies and shows you already have
+
+    ./unified scan                       # what the movie and TV folders hold that the library lacks
+    ./unified scan --import              # add them, with the best TMDB match for each
+
+or Library → "Find files already on disk", where each match can be checked
+first. Each folder (or lone video file) in the movie folder is taken to be a
+movie, each folder in the TV folder a show, best named `Title (Year)`;
+episodes are told by names like `S01E02` or `1x02`, or `Season 01/Episode 2`.
+Files stay where they are and count as in the library, so they aren't
+downloaded again. Nothing else of what is added is wanted, unless you ask
+for what has no file (`--want-missing`).
+
 The Storage tab shows what the download, movie and TV folders take, their
 largest items, and the free space on their disks.
 Nothing new is grabbed when it would leave less than `min_free_gb` free (20 GB
@@ -26,8 +54,9 @@ message when something is imported, a download fails, the VPN drops, or disk
 space runs low.
 
 Finished downloads keep seeding until they have uploaded `seed_ratio` times
-their size (0: no limit), or until unified stops; seeding does not resume
-after a restart. Indexers,
+their size (0: no limit), also after a restart: `serve` seeds them again,
+counting what they uploaded before towards the ratio. A download whose files
+are gone from the download folder stops seeding. Indexers,
 the TMDB key, quality rules and the password can be changed there and apply
 at once; saving rewrites the config file (without its comments).
 
@@ -52,7 +81,8 @@ the address Vite prints; API calls are forwarded to the running server.
     ./unified run                        # search, download and import everything wanted
 
 `unified run` exits when all downloads are imported; `unified run --seed` keeps
-seeding until Ctrl-C. Interrupted downloads resume on the next run.
+seeding until Ctrl-C, picking up what was seeding before. Interrupted
+downloads resume on the next run.
 
 ## Sharing the network
 
@@ -126,14 +156,17 @@ The image builds for amd64 and arm64:
 ## Layout
 
     main.go, run.go        CLI and the wanted -> downloading -> imported loop
+    scan.go                taking files already in the library folders into the library
+    lists.go               following Trakt and TMDB lists
     queue.go               download and seeding slots, speed limits, connections
     indexers.go            backing off indexers that fail
-    api.go                 JSON API for the web UI, and serving the built app
+    api.go, api_library.go JSON API for the web UI, and serving the built app
     ui/                    the web UI (React, TypeScript, Vite)
     Dockerfile, docker/    container image and its startup script
     internal/config        TOML config
     internal/store         SQLite library and download state
-    internal/tmdb          metadata lookups
+    internal/tmdb          metadata lookups, browsing and lists
+    internal/trakt         Trakt watchlists and lists
     internal/xem           scene numbering and names from TheXEM
     internal/torznab       indexer search
     internal/release       release name parsing and ranking

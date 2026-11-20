@@ -36,7 +36,7 @@ export default function Add({ kind, query }: { kind: Kind; query: string }) {
   )
 }
 
-function Result({ kind, result }: { kind: Kind; result: FindResult }) {
+export function Result({ kind, result }: { kind: Kind; result: FindResult }) {
   const action = useAction()
   const [wantAll, setWantAll] = useState(true)
   const add = async () => {

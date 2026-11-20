@@ -14,7 +14,9 @@ export interface Progress {
   total: number
   peers: number
   rate: number
-  /** Seeding downloads: bytes uploaded since unified started, and as a multiple of the size. */
+  /** Bytes per second uploaded to peers. */
+  upRate: number
+  /** Bytes uploaded over all runs, and that as a multiple of the size. */
   uploaded: number
   ratio: number
   /** Peer connections over uTP and TCP. */
@@ -98,6 +100,97 @@ export interface Status {
     maxDownloads: number
     maxSeeds: number
   }
+  transfer: TransferTotals
+}
+
+/** Torrent data moved: over all runs, since unified started, and how fast now. */
+export interface TransferTotals {
+  downloaded: number
+  uploaded: number
+  sessionDownloaded: number
+  sessionUploaded: number
+  /** Bytes per second, over all torrents. */
+  downRate: number
+  upRate: number
+}
+
+export type HistoryEventKind =
+  | 'added'
+  | 'scanned'
+  | 'grabbed'
+  | 'imported'
+  | 'failed'
+  | 'cancelled'
+  | 'deleted'
+  | 'removed'
+  | 'seeded'
+
+export interface HistoryEvent {
+  id: number
+  at: string
+  event: HistoryEventKind
+  mediaId?: number
+  /** What it was about: "Severance S02E03 - Who Is Alive?". */
+  title: string
+  /** The release, file or reason. */
+  detail?: string
+  /** The movie or show is still in the library. */
+  inLibrary: boolean
+}
+
+export interface ScanMatch {
+  tmdbId: number
+  title: string
+  year: number
+  poster: string
+  libraryId?: number
+}
+
+export interface ScanEntry {
+  kind: Kind
+  path: string
+  name: string
+  title: string
+  year: number
+  files: number
+  size: number
+  /** Shows: episodes told apart by file name, and files whose episode could not be told. */
+  episodes: number
+  unknown: string[]
+  /** Video files the library has already. */
+  known: number
+  /** TMDB matches, best first. */
+  matches: ScanMatch[]
+  error?: string
+}
+
+export interface ScanResult {
+  path: string
+  mediaId?: number
+  title?: string
+  imported: number
+  error?: string
+}
+
+export type ListKind = 'trakt-watchlist' | 'trakt-list' | 'tmdb-list'
+export type ListWant = 'all' | 'first' | 'none'
+export type BrowseList = 'trending' | 'popular' | 'top_rated' | 'upcoming'
+
+export interface WatchList {
+  id: number
+  kind: ListKind
+  source: string
+  name: string
+  want: ListWant
+  syncedAt?: string
+  lastError?: string
+}
+
+export interface SyncResult {
+  id: number
+  /** Titles added to the library. */
+  added: string[]
+  error?: string
 }
 
 export interface StatusResponse {
@@ -195,6 +288,7 @@ export interface Transfer {
 
 export interface Settings {
   tmdbKey: string
+  traktClientId: string
   indexers: Indexer[]
   quality: Quality
   /** 0 means no limit. */
@@ -219,6 +313,7 @@ export interface Settings {
 
 export interface SettingsUpdate {
   tmdbKey: string
+  traktClientId: string
   indexers: Indexer[]
   quality: Quality
   seedRatio: number
@@ -288,4 +383,17 @@ export const api = {
   testIndexer: (ix: Indexer) => request<{ ok: boolean; error?: string }>('POST', 'api/indexers/test', ix),
   storage: (fresh = false) => request<StorageReport>('GET', `api/storage${fresh ? '?fresh=1' : ''}`),
   testNotify: (url: string) => request<{ ok: boolean; error?: string }>('POST', 'api/notify/test', { url }),
+  history: (p: { media?: number; before?: number; events?: string; limit?: number }) =>
+    request<{ events: HistoryEvent[]; more: boolean }>('GET', `api/history?${q(p)}`),
+  /** Lists what the movie and TV folders hold, with TMDB matches; adds nothing. */
+  scan: () => request<{ entries: ScanEntry[]; moviesDir: string; tvDir: string }>('POST', 'api/scan'),
+  scanImport: (choices: { kind: Kind; path: string; tmdbId: number }[], wantMissing: boolean) =>
+    request<ScanResult[]>('POST', 'api/scan/import', { choices, wantMissing }),
+  discover: (kind: Kind, list: BrowseList, page: number) =>
+    request<{ results: FindResult[]; pages: number }>('GET', `api/discover?${q({ kind, list, page })}`),
+  lists: () => request<{ lists: WatchList[]; trakt: boolean }>('GET', 'api/lists'),
+  addList: (kind: ListKind, source: string, want: ListWant) =>
+    request<SyncResult>('POST', 'api/lists', { kind, source, want }),
+  removeList: (id: number) => request<void>('DELETE', `api/lists/${id}`),
+  syncList: (id: number) => request<SyncResult>('POST', `api/lists/${id}/sync`),
 }

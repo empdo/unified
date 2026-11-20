@@ -31,6 +31,7 @@ const usage = `usage: unified <command>
   add show <title> [-s N] [-e N]    add a show; limit to a season or one episode
   list [media-id]                   show the library, or one show's episodes
   rm <media-id>                     remove from the library (files are kept)
+  scan [--import] [--want-missing]  find movies and shows already in the library folders
   search <media-id> [season [ep]]   show how releases are ranked, without grabbing
   run [--seed]                      grab, download and import everything wanted
   downloads                         list downloads
@@ -100,6 +101,8 @@ func dispatch(cmd string, args []string) error {
 		return st.RemoveMedia(id)
 	case "search":
 		return cmdSearch(ctx, cfg, st, args)
+	case "scan":
+		return cmdScan(cfg, st, args)
 	case "run":
 		return cmdRun(ctx, cfg, st, len(args) > 0 && args[0] == "--seed")
 	case "downloads":

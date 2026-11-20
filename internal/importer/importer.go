@@ -36,14 +36,19 @@ var subtitleExts = map[string]bool{
 	".srt": true, ".ass": true, ".ssa": true, ".sub": true, ".idx": true, ".vtt": true, ".sup": true,
 }
 
+// IsVideo reports whether a file is a video, not counting samples.
+func IsVideo(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return videoExts[filepath.Ext(base)] && !strings.Contains(base, "sample")
+}
+
 // Import links the video files that match the given items into the library,
 // along with the subtitle files that come with them, and reports which items
 // were satisfied.
 func Import(cfg *config.Config, m store.Media, items []store.Item, torrentName string, files []File) ([]Result, error) {
 	var videos []File
 	for _, f := range files {
-		base := strings.ToLower(filepath.Base(f.Path))
-		if videoExts[filepath.Ext(base)] && !strings.Contains(base, "sample") {
+		if IsVideo(f.Path) {
 			videos = append(videos, f)
 		}
 	}

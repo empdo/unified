@@ -7,6 +7,7 @@ import { href, navigate } from '../router'
 import { ItemStatus } from '../itemstate'
 import { ShowSeasons } from '../seasons'
 import { useActiveByMedia } from '../status'
+import { MediaHistory } from './History'
 
 export default function MediaPage({ id }: { id: number }) {
   const media = useData(() => api.media(id), [id], 5000)
@@ -59,6 +60,7 @@ export default function MediaPage({ id }: { id: number }) {
           <ShowSeasons media={m} downloads={downloads} reload={media.reload} />
         </section>
       )}
+      <MediaHistory media={m.id} />
     </>
   )
 }

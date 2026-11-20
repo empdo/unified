@@ -230,3 +230,33 @@ func TestSeedRatioSetting(t *testing.T) {
 }
 
 func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+func TestHistoryAndLists(t *testing.T) {
+	s, h := newTestServer(t, "")
+	s.st.AddEvent(store.EventAdded, 0, "Film (2020)", "")
+	s.st.AddEvent(store.EventGrabbed, 0, "Film (2020)", "Film.2020.1080p")
+	w := do(h, "GET", "/api/history?limit=1", "", "")
+	var hist struct {
+		Events []store.Event `json:"events"`
+		More   bool          `json:"more"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &hist); err != nil || w.Code != 200 {
+		t.Fatalf("history: %d %s", w.Code, w.Body)
+	}
+	if len(hist.Events) != 1 || hist.Events[0].Event != store.EventGrabbed || !hist.More {
+		t.Errorf("history: %+v", hist)
+	}
+
+	for _, body := range []string{
+		`{"kind": "imdb", "source": "x", "want": "all"}`,
+		`{"kind": "tmdb-list", "source": "not a list", "want": "all"}`,
+		`{"kind": "tmdb-list", "source": "8123", "want": "some"}`,
+	} {
+		if w := do(h, "POST", "/api/lists", body, ""); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", body, w.Code, w.Body)
+		}
+	}
+	if w := do(h, "GET", "/api/lists", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"lists":[]`) {
+		t.Errorf("lists: %d %s", w.Code, w.Body)
+	}
+}

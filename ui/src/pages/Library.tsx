@@ -34,7 +34,10 @@ export default function Library() {
       {library.data?.length === 0 && (
         <div className="empty">
           <h2>Your library is empty</h2>
-          <p className="muted">Search for a movie or show at the top of the page to add it.</p>
+          <p className="muted">
+            Search for a movie or show at the top of the page to add it, <a href={href('/discover')}>browse what's
+            popular</a>, or <a href={href('/scan')}>find what's already in your movie and TV folders</a>.
+          </p>
         </div>
       )}
       {all.length > 0 && (
@@ -43,6 +46,9 @@ export default function Library() {
             <div className="section-head">
               <h2>Shows</h2>
               <span className="muted small">{plural(shows.length, 'show')}</span>
+              <a className="small section-link" href={href('/scan')}>
+                Find files already on disk
+              </a>
             </div>
             {shows.length === 0 && <p className="muted">No shows yet.</p>}
             <div className="show-grid">

@@ -37,6 +37,7 @@ export default function Downloads() {
         </Notice>
       )}
       {action.error && <Notice kind="error">{action.error}</Notice>}
+      <Totals />
       <Transfer />
 
       <section>
@@ -88,8 +89,8 @@ export default function Downloads() {
           <h2>Seeding</h2>
           <p className="muted small">
             {status.seedRatio > 0
-              ? `Each stops seeding at ratio ${status.seedRatio}, or when unified stops.`
-              : 'These seed until unified stops. Set a seed ratio in the settings to stop sooner.'}
+              ? `Each stops seeding at ratio ${status.seedRatio}, also counting what it uploaded before a restart.`
+              : 'These seed for as long as unified runs, and again after a restart. Set a seed ratio in the settings to stop sooner.'}
             {s.limits.maxSeeds > 0 && ` ${plural(s.limits.maxSeeds, 'download')} seed at a time; the rest wait their turn.`}
           </p>
           <ul className="list">
@@ -99,9 +100,18 @@ export default function Downloads() {
                   {p.name}
                 </a>
                 <span className="small muted nowrap">
-                  {p.paused
-                    ? `waiting to seed · ratio ${p.ratio.toFixed(2)}`
-                    : `ratio ${p.ratio.toFixed(2)} · ${bytes(p.uploaded)} up · ${plural(p.peers, 'peer')}`}
+                  {!p.hasInfo
+                    ? `starting · ratio ${p.ratio.toFixed(2)}`
+                    : p.paused
+                      ? `waiting to seed · ratio ${p.ratio.toFixed(2)}`
+                      : [
+                          p.upRate >= 1024 && `↑ ${rate(p.upRate)}`,
+                          `ratio ${p.ratio.toFixed(2)}`,
+                          `${bytes(p.uploaded)} up`,
+                          plural(p.peers, 'peer'),
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')}
                 </span>
               </li>
             ))}
@@ -130,6 +140,54 @@ export default function Downloads() {
         </section>
       )}
     </>
+  )
+}
+
+/** How much has been downloaded and uploaded, and whether anything moves right now. */
+function Totals() {
+  const status = useStatus()
+  if (!status) return null
+  const { transfer: t, active, seeding } = status.status
+  const ratio = t.downloaded > 0 ? (t.uploaded / t.downloaded).toFixed(2) : '–'
+  return (
+    <section className="totals" aria-label="Data transferred">
+      <div className="total">
+        <span className="total-label">Downloaded</span>
+        <strong className="total-value">{bytes(t.downloaded)}</strong>
+        <span className="small muted">{bytes(t.sessionDownloaded)} since unified started</span>
+      </div>
+      <div className="total">
+        <span className="total-label">Uploaded</span>
+        <strong className="total-value">{bytes(t.uploaded)}</strong>
+        <span className="small muted">
+          {bytes(t.sessionUploaded)} since unified started · overall ratio {ratio}
+        </span>
+      </div>
+      <div className="total total-now">
+        <span className="total-label">Right now</span>
+        <NowMoving downloading={active.length} seeding={seeding.filter((p) => !p.paused).length} />
+      </div>
+    </section>
+  )
+}
+
+/** Whether anything downloads or uploads now, and how fast. Rates below 1 KiB/s count as idle. */
+export function NowMoving({ downloading, seeding }: { downloading: number; seeding: number }) {
+  const t = useStatus()?.status.transfer
+  if (!t) return null
+  const down = t.downRate >= 1024
+  const up = t.upRate >= 1024
+  return (
+    <span className="now-moving">
+      <span className={down ? 'moving moving-down' : 'moving'}>
+        ↓ {down ? rate(t.downRate) : 'idle'}
+        {downloading > 0 && <span className="small muted"> · {plural(downloading, 'download')}</span>}
+      </span>
+      <span className={up ? 'moving moving-up' : 'moving'}>
+        ↑ {up ? rate(t.upRate) : 'idle'}
+        {seeding > 0 && <span className="small muted"> · {plural(seeding, 'seed')}</span>}
+      </span>
+    </span>
   )
 }
 

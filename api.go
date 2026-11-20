@@ -38,6 +38,10 @@ type server struct {
 	st   *store.Store
 	run  *runner
 
+	// One list sync, and one scan of the library folders, at a time.
+	listsMu sync.Mutex
+	scanMu  sync.Mutex
+
 	// The last storage report; walking the library takes a moment.
 	storageMu   sync.Mutex
 	storageAt   time.Time
@@ -70,6 +74,7 @@ func cmdServe(ctx context.Context, st *store.Store, args []string) error {
 	srv := &http.Server{Handler: s.routes()}
 	go srv.Serve(ln)
 	go s.fillArt(ctx)
+	go s.syncListsEvery(ctx, listInterval)
 	fmt.Printf("web UI at http://%s\n", ln.Addr())
 
 	err = r.loop(true)
@@ -103,6 +108,14 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("POST /api/notify/test", s.testNotify)
 	api.HandleFunc("GET /api/storage", s.storage)
 	api.HandleFunc("GET /api/debug/peers", s.debugPeers)
+	api.HandleFunc("GET /api/history", s.history)
+	api.HandleFunc("POST /api/scan", s.scan)
+	api.HandleFunc("POST /api/scan/import", s.scanImport)
+	api.HandleFunc("GET /api/discover", s.discover)
+	api.HandleFunc("GET /api/lists", s.lists)
+	api.HandleFunc("POST /api/lists", s.addList)
+	api.HandleFunc("DELETE /api/lists/{id}", s.removeList)
+	api.HandleFunc("POST /api/lists/{id}/sync", s.syncListNow)
 	api.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("no such API endpoint"))
 	})
@@ -357,6 +370,9 @@ func (s *server) addMedia(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if m, err := s.st.Media(id); err == nil {
+		s.st.AddEvent(store.EventAdded, id, describe(m, nil), "")
+	}
 	s.run.Wake()
 	writeJSON(w, map[string]int64{"id": id})
 }
@@ -554,32 +570,27 @@ func (s *server) find(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	media, err := s.st.AllMedia()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	inLibrary := map[int]int64{}
-	for _, m := range media {
-		if m.Kind == kind {
-			inLibrary[m.TMDBID] = m.ID
-		}
-	}
-	type resultView struct {
-		TMDBID    int    `json:"tmdbId"`
-		Title     string `json:"title"`
-		Year      int    `json:"year"`
-		Poster    string `json:"poster"`
-		Overview  string `json:"overview"`
-		LibraryID int64  `json:"libraryId,omitempty"`
-	}
+	writeJSON(w, s.resultViews(kind, results[:min(len(results), 20)]))
+}
+
+type resultView struct {
+	TMDBID    int    `json:"tmdbId"`
+	Title     string `json:"title"`
+	Year      int    `json:"year"`
+	Poster    string `json:"poster"`
+	Overview  string `json:"overview"`
+	LibraryID int64  `json:"libraryId,omitempty"`
+}
+
+// resultViews shows TMDB results, with the library's id for those in it.
+func (s *server) resultViews(kind string, results []tmdb.Result) []resultView {
 	out := []resultView{}
-	for _, res := range results[:min(len(results), 20)] {
+	for _, res := range results {
 		out = append(out, resultView{
-			res.ID, res.Title, res.Year, tmdb.ImageURL(res.Poster, "w342"), res.Overview, inLibrary[res.ID],
+			res.ID, res.Title, res.Year, tmdb.ImageURL(res.Poster, "w342"), res.Overview, s.st.MediaByTMDB(kind, res.ID),
 		})
 	}
-	writeJSON(w, out)
+	return out
 }
 
 func (s *server) releases(w http.ResponseWriter, r *http.Request) {
@@ -719,8 +730,9 @@ func (s *server) settings(w http.ResponseWriter, r *http.Request) {
 		indexers = append(indexers, indexerView{ix.Name, ix.URL, ix.APIKey})
 	}
 	writeJSON(w, map[string]any{
-		"tmdbKey":  c.TMDBKey,
-		"indexers": indexers,
+		"tmdbKey":       c.TMDBKey,
+		"traktClientId": c.TraktClientID,
+		"indexers":      indexers,
 		"quality": qualityView{
 			Resolutions: nonNil(c.Quality.Resolutions), PreferCodecs: nonNil(c.Quality.PreferCodecs),
 			MaxMovieGB: c.Quality.MaxMovieGB, MaxEpisodeGB: c.Quality.MaxEpisodeGB, MinSeeders: c.Quality.MinSeeders,
@@ -762,10 +774,11 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		Indexers []indexerView `json:"indexers"`
 		Quality  qualityView   `json:"quality"`
 		// nil leaves these as they are.
-		SeedRatio *float64      `json:"seedRatio"`
-		MinFreeGB *float64      `json:"minFreeGB"`
-		NotifyURL *string       `json:"notifyURL"`
-		Transfer  *transferView `json:"transfer"`
+		TraktClientID *string       `json:"traktClientId"`
+		SeedRatio     *float64      `json:"seedRatio"`
+		MinFreeGB     *float64      `json:"minFreeGB"`
+		NotifyURL     *string       `json:"notifyURL"`
+		Transfer      *transferView `json:"transfer"`
 		// nil leaves the password as it is; "" removes it.
 		Password *string `json:"password"`
 	}
@@ -797,6 +810,9 @@ func (s *server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.NotifyURL != nil {
 			c.NotifyURL = *req.NotifyURL
+		}
+		if req.TraktClientID != nil {
+			c.TraktClientID = strings.TrimSpace(*req.TraktClientID)
 		}
 		if t := req.Transfer; t != nil {
 			c.MaxDownloadKBps, c.MaxUploadKBps = t.MaxDownloadKBps, t.MaxUploadKBps
